@@ -1243,7 +1243,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" };
+	// DISABLE_OMC=1: pi sessions have their own rule infrastructure (skills with
+	// triggers, composite AGENTS.md). The oh-my-claudecode plugin's Stop/UserPromptSubmit
+	// hooks (workflow-drift-guard nudging AskUserQuestion — a tool pi doesn't surface —
+	// skill-injector, rules-injector) duplicate that and are interactive-CC-specific noise
+	// here. OMC stays active for native Claude Code.
+	const childEnv = { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", DISABLE_OMC: "1" };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
