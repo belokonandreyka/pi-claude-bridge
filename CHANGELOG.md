@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Add: forward global + project AGENTS.md** — Claude Code now receives both `~/.pi/agent/AGENTS.md` and the nearest project `AGENTS.md` (walking up from cwd), separated by `--- from <path> ---` provenance headers. Sanitizer runs per-body so headers (which may contain `~/.pi`, `pi-*` repo names) survive verbatim; fenced code blocks still pass through untouched. Single-source case emits no separator (byte-identical to prior output). Symlinked walk-ups that land on the global file are deduped via `realpath`.
+
 ## 0.6.2 — 2026-07-06
 
 - **Fix: Sonnet 5 and Fable 5 with 1M context** — bare model IDs (`claude-sonnet-5`, `claude-fable-5`) are 200K context. Must pass `[1m]` suffix for both, similar to Opus 4.8.
