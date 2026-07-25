@@ -1050,11 +1050,14 @@ async function consumeQuery(
 			case "rate_limit_event": {
 				const info = (message as any).rate_limit_info;
 				debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+				// resetsAt is unix seconds, not ms; utilization is a 0..1 fraction, not a
+				// percentage. Both need converting - seven_day resets days out, so the
+				// date matters as much as the time.
 				if (info?.status === "rejected") {
-					const resetsAt = info.resetsAt ? new Date(info.resetsAt).toLocaleTimeString() : "unknown";
+					const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleString() : "unknown";
 					piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
 				} else if (info?.status === "allowed_warning") {
-					piUI?.notify(`Claude rate limit warning: ${Math.round(info.utilization ?? 0)}% used (${info.rateLimitType ?? ""})`, "warning");
+					piUI?.notify(`Claude rate limit warning: ${Math.round((info.utilization ?? 0) * 100)}% used (${info.rateLimitType ?? ""})`, "warning");
 				}
 				break;
 			}
