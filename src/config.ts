@@ -20,9 +20,20 @@ export interface Config {
 		allowFullMode?: boolean;
 		appendSkills?: boolean;
 	};
+	/** Question channel from the delegated Claude back to the operator. */
+	askOrchestrator?: AskOrchestratorConfig;
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
 		appendSystemPrompt?: boolean;
+		// Send Claude Code's full preset system prompt (default true). Setting
+		// this to false replaces it with a minimal prompt: the preset mostly
+		// describes Claude Code's own tools and behaviours, and this provider
+		// disables those (`tools: []`) because pi's tools arrive over MCP
+		// instead. Measured 2026-08-31 in vitu-portal/site/Scripts: the preset
+		// accounted for ~26k of a 44k cold start. Verify behaviour before
+		// relying on it — subscription requests may be sensitive to how the
+		// prompt looks.
+		systemPromptPreset?: boolean;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;

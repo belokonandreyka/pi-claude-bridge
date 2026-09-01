@@ -141,6 +141,18 @@ function errorMessage(err: unknown): string {
 // AskClaude mode presets — controls which CC tools are blocked per mode.
 // Only block tools that can't work (no pi TUI for user interaction).
 // Other CC tools (Agent, SendMessage, RemoteTrigger, Tasks, etc.) are intentionally not blocked.
+// Used instead of Claude Code's preset when `provider.systemPromptPreset` is
+// false. The preset is written for an agent driving Claude Code's own tools;
+// this provider disables those and supplies pi's over MCP, so most of it
+// describes a session the model is not in. What it still needs is who is
+// calling, where the tools come from, and that the appended AGENTS.md and
+// skills are the operating instructions.
+const MINIMAL_SYSTEM_PROMPT = `You are the model behind pi, a coding agent. You are called through pi's Claude bridge.
+
+Every tool available to you is provided by pi over MCP; there are no built-in file or shell tools. Use the tools you are given, and say so plainly when a task needs one you do not have.
+
+The instructions that follow are the operating context for this workspace. Treat them as binding, and prefer them over general habits when they conflict.`;
+
 const ASKCLAUDE_ALWAYS_BLOCKED = [
 	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
 	"ToolSearch", // probes for blocked tools, wastes tokens
@@ -1201,21 +1213,30 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
 		? wrapPromptStream(promptBlocks)
 		: promptText;
-	const mcpServers = buildMcpServers(mcpTools, queryCtx);
+	const mcpServers = buildMcpServers(mcpTools, queryCtx, promptText);
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
 	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
+	const usePresetPrompt = providerSettings.systemPromptPreset !== false;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
 	// programmatically and ignore filesystem MCP entries — applied unconditionally because
 	// settingSources=undefined does NOT give isolation (the CC default loads all sources).
-	const settingSources: SettingSource[] | undefined = appendSystemPrompt
-		? undefined
-		: providerSettings.settingSources ?? ["user", "project"];
+	// An explicit setting now wins in both modes. It could previously only be
+	// reached with appendSystemPrompt off, which left the default path unable to
+	// opt out of CC's filesystem sources — and those are not free: with
+	// `undefined` CC loads every source, so a project `CLAUDE.md` containing
+	// `@AGENTS.md` re-imports a file the append already carries. Measured
+	// 2026-08-31 in vitu-portal/site/Scripts: ~15k tokens per request from
+	// project skills, plugin skills and those imports, of which ~4.4k was the
+	// duplicated AGENTS.md. `settingSources: []` isolates it; pi's own skills
+	// are unaffected because they travel in the append.
+	const settingSources: SettingSource[] | undefined =
+		providerSettings.settingSources ?? (appendSystemPrompt ? undefined : ["user", "project"]);
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -1258,10 +1279,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		systemPrompt: {
-			type: "preset", preset: "claude_code",
-			append: systemPromptAppend ? systemPromptAppend : undefined,
-		},
+		systemPrompt: usePresetPrompt
+			? {
+				type: "preset", preset: "claude_code",
+				append: systemPromptAppend ? systemPromptAppend : undefined,
+			}
+			: [MINIMAL_SYSTEM_PROMPT, systemPromptAppend].filter(Boolean).join("\n\n"),
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(settingSources ? { settingSources } : {}),
