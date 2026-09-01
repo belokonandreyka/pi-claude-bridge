@@ -4,6 +4,7 @@
 // console.error, empty object returned) so the extension always starts.
 
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { AskOrchestratorConfig } from "./ask-orchestrator.js";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
@@ -59,8 +60,13 @@ export function tryParseJson(path: string): Partial<Config> {
 export function loadConfig(cwd: string): Config {
 	const global = tryParseJson(join(homedir(), ".pi", "agent", "claude-bridge.json"));
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
+	// askOrchestrator is only emitted when actually configured: callers use
+	// optional chaining, and adding an always-present section would change the
+	// shape loadConfig has always returned.
+	const askOrchestrator = { ...global.askOrchestrator, ...project.askOrchestrator };
 	return {
 		askClaude: { ...global.askClaude, ...project.askClaude },
+		...(Object.keys(askOrchestrator).length ? { askOrchestrator } : {}),
 		provider: { ...global.provider, ...project.provider },
 	};
 }

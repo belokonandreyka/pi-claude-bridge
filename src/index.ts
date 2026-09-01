@@ -18,6 +18,7 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
+import { ASK_ORCHESTRATOR_PARAMETERS, ASK_ORCHESTRATOR_TOOL, AskOrchestratorState, askOrchestratorDescription, createAskOrchestratorHandler } from "./ask-orchestrator.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 
@@ -671,6 +672,16 @@ function mapToolArgs(
 
 // Global (not query state):
 let piUI: ExtensionUIContext | null = null;
+
+// Bridge-internal tool: Claude may call it, pi must never see the call.
+// askOrchestratorSdkName is what appears in tool_use blocks, and is what the
+// two filters below key on.
+let bridgeConfig: Config | null = null;
+let askOrchestratorToolName = ASK_ORCHESTRATOR_TOOL;
+let askOrchestratorSdkName = `${MCP_TOOL_PREFIX}${ASK_ORCHESTRATOR_TOOL}`;
+function isAskOrchestratorCall(name: unknown): boolean {
+	return typeof name === "string" && name === askOrchestratorSdkName;
+}
 const activeQueryContexts = new Set<QueryContext>();
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
@@ -716,8 +727,7 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 // emits tool_use blocks). Results are matched by ID, not position.
 // Handlers close over the captured `queryCtx`, ensuring they operate on the
 // correct query's state while multiple queries run concurrently.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
-	if (!tools.length) return undefined;
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
@@ -737,6 +747,23 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 			});
 		},
 	}));
+	const askConf = bridgeConfig?.askOrchestrator;
+	if (askConf?.enabled !== false) {
+		// Fresh per query, so the question cap resets with each delegation.
+		const askState = new AskOrchestratorState();
+		const askHandler = createAskOrchestratorHandler({
+			getUI: () => piUI,
+			config: askConf,
+			debug,
+			getDelegationBrief: () => brief,
+		});
+		mcpTools.push({
+			name: askOrchestratorToolName,
+			description: askConf?.description ?? askOrchestratorDescription(),
+			inputSchema: jsonSchemaToZodShape(ASK_ORCHESTRATOR_PARAMETERS as unknown as Record<string, unknown>),
+			handler: async (args: Record<string, unknown>) => askHandler(args, askState),
+		} as (typeof mcpTools)[number]);
+	}
 	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
 	return { [MCP_SERVER_NAME]: server };
 }
@@ -871,6 +898,14 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
+			// Bridge-internal question tool: keep it out of both the id list and
+			// turnBlocks. Deltas and content_block_stop for this index then no-op
+			// via their own `if (!block) return`, because those look the block up
+			// by its stored `index`, not by array position.
+			if (isAskOrchestratorCall(event.content_block.name)) {
+				debug(`askOrchestrator: hiding tool_use ${event.content_block.id} from pi`);
+				return;
+			}
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
@@ -985,6 +1020,10 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
 		} else if (block.type === "tool_use") {
+			if (isAskOrchestratorCall(block.name)) {
+				debug(`askOrchestrator: hiding tool_use ${block.id} from pi (batch path)`);
+				continue;
+			}
 			ensureTurnStarted(c);
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(block.id);
@@ -1625,6 +1664,7 @@ export default function (pi: ExtensionAPI) {
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
+	bridgeConfig = config;
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
