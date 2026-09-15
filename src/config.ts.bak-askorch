@@ -4,7 +4,6 @@
 // console.error, empty object returned) so the extension always starts.
 
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { AskOrchestratorConfig } from "./ask-orchestrator.js";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
@@ -21,20 +20,9 @@ export interface Config {
 		allowFullMode?: boolean;
 		appendSkills?: boolean;
 	};
-	/** Question channel from the delegated Claude back to the operator. */
-	askOrchestrator?: AskOrchestratorConfig;
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
 		appendSystemPrompt?: boolean;
-		// Send Claude Code's full preset system prompt (default true). Setting
-		// this to false replaces it with a minimal prompt: the preset mostly
-		// describes Claude Code's own tools and behaviours, and this provider
-		// disables those (`tools: []`) because pi's tools arrive over MCP
-		// instead. Measured 2026-08-31 in vitu-portal/site/Scripts: the preset
-		// accounted for ~26k of a 44k cold start. Verify behaviour before
-		// relying on it — subscription requests may be sensitive to how the
-		// prompt looks.
-		systemPromptPreset?: boolean;
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToClaudeCodeExecutable?: string;
@@ -57,27 +45,11 @@ export function tryParseJson(path: string): Partial<Config> {
 	}
 }
 
-/**
- * The Pi profile directory this session runs in. `mpi` switches it with
- * PI_CODING_AGENT_DIR; reading ~/.pi/agent regardless gave the personal profile
- * the work profile's bridge config and its AGENTS.md.
- */
-export function piAgentDir(env: NodeJS.ProcessEnv = process.env): string {
-	const fromEnv = env.PI_CODING_AGENT_DIR?.trim();
-	if (fromEnv) return fromEnv;
-	return join(env.HOME?.trim() || homedir(), ".pi", "agent");
-}
-
 export function loadConfig(cwd: string): Config {
-	const global = tryParseJson(join(piAgentDir(), "claude-bridge.json"));
+	const global = tryParseJson(join(homedir(), ".pi", "agent", "claude-bridge.json"));
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
-	// askOrchestrator is only emitted when actually configured: callers use
-	// optional chaining, and adding an always-present section would change the
-	// shape loadConfig has always returned.
-	const askOrchestrator = { ...global.askOrchestrator, ...project.askOrchestrator };
 	return {
 		askClaude: { ...global.askClaude, ...project.askClaude },
-		...(Object.keys(askOrchestrator).length ? { askOrchestrator } : {}),
 		provider: { ...global.provider, ...project.provider },
 	};
 }

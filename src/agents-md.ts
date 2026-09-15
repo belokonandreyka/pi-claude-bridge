@@ -11,7 +11,7 @@
 // Separator lines never enter the sanitizer, so their source paths stay intact.
 
 import { existsSync, readFileSync, realpathSync } from "fs";
-import { homedir } from "os";
+import { piAgentDir } from "./config.js";
 import { dirname, join, resolve } from "path";
 
 // Best-effort realpath so a symlinked walk-up to the same file as the global
@@ -25,7 +25,7 @@ function canonical(p: string): string {
 }
 
 function globalAgentsPath(): string {
-	return join(homedir(), ".pi", "agent", "AGENTS.md");
+	return join(piAgentDir(), "AGENTS.md");
 }
 
 export function resolveAgentsMdPath(): string | undefined {

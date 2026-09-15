@@ -8,6 +8,7 @@ import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
+import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
@@ -15,9 +16,8 @@ import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.j
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
-import { loadConfig, type Config, piAgentDir } from "./config.js";
+import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
-import { ASK_ORCHESTRATOR_PARAMETERS, ASK_ORCHESTRATOR_TOOL, AskOrchestratorState, askOrchestratorDescription, createAskOrchestratorHandler } from "./ask-orchestrator.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 
@@ -32,8 +32,8 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(piAgentDir(), "claude-bridge.log");
-const DIAG_LOG_PATH = join(piAgentDir(), "claude-bridge-diag.log");
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(homedir(), ".pi", "agent", "claude-bridge.log");
+const DIAG_LOG_PATH = join(homedir(), ".pi", "agent", "claude-bridge-diag.log");
 
 // Ensure log directories exist when debug is enabled
 if (DEBUG) {
@@ -141,18 +141,6 @@ function errorMessage(err: unknown): string {
 // AskClaude mode presets — controls which CC tools are blocked per mode.
 // Only block tools that can't work (no pi TUI for user interaction).
 // Other CC tools (Agent, SendMessage, RemoteTrigger, Tasks, etc.) are intentionally not blocked.
-// Used instead of Claude Code's preset when `provider.systemPromptPreset` is
-// false. The preset is written for an agent driving Claude Code's own tools;
-// this provider disables those and supplies pi's over MCP, so most of it
-// describes a session the model is not in. What it still needs is who is
-// calling, where the tools come from, and that the appended AGENTS.md and
-// skills are the operating instructions.
-const MINIMAL_SYSTEM_PROMPT = `You are the model behind pi, a coding agent. You are called through pi's Claude bridge.
-
-Every tool available to you is provided by pi over MCP; there are no built-in file or shell tools. Use the tools you are given, and say so plainly when a task needs one you do not have.
-
-The instructions that follow are the operating context for this workspace. Treat them as binding, and prefer them over general habits when they conflict.`;
-
 const ASKCLAUDE_ALWAYS_BLOCKED = [
 	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
 	"ToolSearch", // probes for blocked tools, wastes tokens
@@ -671,16 +659,6 @@ function mapToolArgs(
 
 // Global (not query state):
 let piUI: ExtensionUIContext | null = null;
-
-// Bridge-internal tool: Claude may call it, pi must never see the call.
-// askOrchestratorSdkName is what appears in tool_use blocks, and is what the
-// two filters below key on.
-let bridgeConfig: Config | null = null;
-let askOrchestratorToolName = ASK_ORCHESTRATOR_TOOL;
-let askOrchestratorSdkName = `${MCP_TOOL_PREFIX}${ASK_ORCHESTRATOR_TOOL}`;
-function isAskOrchestratorCall(name: unknown): boolean {
-	return typeof name === "string" && name === askOrchestratorSdkName;
-}
 const activeQueryContexts = new Set<QueryContext>();
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
@@ -726,7 +704,8 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 // emits tool_use blocks). Results are matched by ID, not position.
 // Handlers close over the captured `queryCtx`, ensuring they operate on the
 // correct query's state while multiple queries run concurrently.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
+	if (!tools.length) return undefined;
 	const mcpTools = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
@@ -746,23 +725,6 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string):
 			});
 		},
 	}));
-	const askConf = bridgeConfig?.askOrchestrator;
-	if (askConf?.enabled !== false) {
-		// Fresh per query, so the question cap resets with each delegation.
-		const askState = new AskOrchestratorState();
-		const askHandler = createAskOrchestratorHandler({
-			getUI: () => piUI,
-			config: askConf,
-			debug,
-			getDelegationBrief: () => brief,
-		});
-		mcpTools.push({
-			name: askOrchestratorToolName,
-			description: askConf?.description ?? askOrchestratorDescription(),
-			inputSchema: jsonSchemaToZodShape(ASK_ORCHESTRATOR_PARAMETERS as unknown as Record<string, unknown>),
-			handler: async (args: Record<string, unknown>) => askHandler(args, askState),
-		} as (typeof mcpTools)[number]);
-	}
 	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
 	return { [MCP_SERVER_NAME]: server };
 }
@@ -897,14 +859,6 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
-			// Bridge-internal question tool: keep it out of both the id list and
-			// turnBlocks. Deltas and content_block_stop for this index then no-op
-			// via their own `if (!block) return`, because those look the block up
-			// by its stored `index`, not by array position.
-			if (isAskOrchestratorCall(event.content_block.name)) {
-				debug(`askOrchestrator: hiding tool_use ${event.content_block.id} from pi`);
-				return;
-			}
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
@@ -1019,10 +973,6 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
 		} else if (block.type === "tool_use") {
-			if (isAskOrchestratorCall(block.name)) {
-				debug(`askOrchestrator: hiding tool_use ${block.id} from pi (batch path)`);
-				continue;
-			}
 			ensureTurnStarted(c);
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(block.id);
@@ -1251,30 +1201,21 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
 		? wrapPromptStream(promptBlocks)
 		: promptText;
-	const mcpServers = buildMcpServers(mcpTools, queryCtx, promptText);
+	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
 	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
 	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-	const usePresetPrompt = providerSettings.systemPromptPreset !== false;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
 	// programmatically and ignore filesystem MCP entries — applied unconditionally because
 	// settingSources=undefined does NOT give isolation (the CC default loads all sources).
-	// An explicit setting now wins in both modes. It could previously only be
-	// reached with appendSystemPrompt off, which left the default path unable to
-	// opt out of CC's filesystem sources — and those are not free: with
-	// `undefined` CC loads every source, so a project `CLAUDE.md` containing
-	// `@AGENTS.md` re-imports a file the append already carries. Measured
-	// 2026-08-31 in vitu-portal/site/Scripts: ~15k tokens per request from
-	// project skills, plugin skills and those imports, of which ~4.4k was the
-	// duplicated AGENTS.md. `settingSources: []` isolates it; pi's own skills
-	// are unaffected because they travel in the append.
-	const settingSources: SettingSource[] | undefined =
-		providerSettings.settingSources ?? (appendSystemPrompt ? undefined : ["user", "project"]);
+	const settingSources: SettingSource[] | undefined = appendSystemPrompt
+		? undefined
+		: providerSettings.settingSources ?? ["user", "project"];
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
@@ -1317,12 +1258,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		systemPrompt: usePresetPrompt
-			? {
-				type: "preset", preset: "claude_code",
-				append: systemPromptAppend ? systemPromptAppend : undefined,
-			}
-			: [MINIMAL_SYSTEM_PROMPT, systemPromptAppend].filter(Boolean).join("\n\n"),
+		systemPrompt: {
+			type: "preset", preset: "claude_code",
+			append: systemPromptAppend ? systemPromptAppend : undefined,
+		},
 		extraArgs,
 		...(effort ? { effort } : {}),
 		...(settingSources ? { settingSources } : {}),
@@ -1663,7 +1602,6 @@ export default function (pi: ExtensionAPI) {
 	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
 
 	const config = loadConfig(process.cwd());
-	bridgeConfig = config;
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models

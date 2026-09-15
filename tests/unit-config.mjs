@@ -64,3 +64,48 @@ describe("loadConfig", () => {
 		}
 	}));
 });
+
+
+it("piAgentDir follows PI_CODING_AGENT_DIR and falls back to ~/.pi/agent", async () => {
+	const { piAgentDir } = await import("../src/config.ts");
+	assert.equal(piAgentDir({ PI_CODING_AGENT_DIR: "/tmp/pi-personal/agent", HOME: "/tmp/h" }), "/tmp/pi-personal/agent");
+	assert.equal(piAgentDir({ HOME: "/tmp/h" }), "/tmp/h/.pi/agent");
+});
+
+it("loadConfig and the global AGENTS.md come from the active profile, not ~/.pi/agent", async () => {
+	const os = await import("node:os");
+	const fs = await import("node:fs");
+	const path = await import("node:path");
+	const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-profile-"));
+	const work = path.join(home, ".pi", "agent");
+	const personal = path.join(home, ".pi-personal", "agent");
+	fs.mkdirSync(work, { recursive: true });
+	fs.mkdirSync(personal, { recursive: true });
+	fs.writeFileSync(path.join(work, "claude-bridge.json"), JSON.stringify({ provider: { plan: "pro" } }));
+	fs.writeFileSync(path.join(personal, "claude-bridge.json"), JSON.stringify({ provider: { plan: "max" } }));
+	fs.writeFileSync(path.join(work, "AGENTS.md"), "work rules");
+	fs.writeFileSync(path.join(personal, "AGENTS.md"), "personal rules");
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cwd-"));
+	const saved = { HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+	try {
+		process.env.HOME = home;
+		process.env.PI_CODING_AGENT_DIR = personal;
+		const { loadConfig } = await import("../src/config.ts");
+		const { resolveAgentsMdPath } = await import("../src/agents-md.ts");
+		assert.equal(loadConfig(cwd).provider.plan, "max");
+		const prevCwd = process.cwd();
+		process.chdir(cwd);
+		try {
+			assert.equal(resolveAgentsMdPath(), path.join(personal, "AGENTS.md"));
+		} finally {
+			process.chdir(prevCwd);
+		}
+		delete process.env.PI_CODING_AGENT_DIR;
+		assert.equal(loadConfig(cwd).provider.plan, "pro");
+	} finally {
+		for (const [k, v] of Object.entries(saved)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	}
+});

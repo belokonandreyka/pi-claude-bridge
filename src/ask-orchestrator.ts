@@ -16,9 +16,9 @@
 // to execute a tool it does not have and every later tool call would be handed
 // the wrong toolCallId.
 
+import { piAgentDir } from "./config.js";
 import { completeSimple, getModels } from "@earendil-works/pi-ai/compat";
 import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
 import { join } from "path";
 import type { Context, Model } from "@earendil-works/pi-ai";
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
@@ -103,11 +103,6 @@ export function filterFallbackChain(
 	return out;
 }
 
-function piAgentDir(): string {
-	// Honour the profile switch; the bridge's own config.ts still hardcodes
-	// ~/.pi/agent, which is wrong for the mpi profile.
-	return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
-}
 
 function loadFallbackChain(allowPaid: boolean, debug: (...args: unknown[]) => void): { provider: string; id: string }[] {
 	const path = join(piAgentDir(), "model-fallback.json");
