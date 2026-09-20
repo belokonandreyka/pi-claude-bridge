@@ -17,6 +17,7 @@ import { extractAllToolResults as _extractAllToolResults, type McpResult } from 
 import { QueryContext, ctx } from "./query-state.js";
 import { loadConfig, type Config, piAgentDir } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
+import { toLegacyContext, withoutSystemMessages } from "./transcript-compat.js";
 import { ASK_ORCHESTRATOR_PARAMETERS, ASK_ORCHESTRATOR_TOOL, AskOrchestratorState, askOrchestratorDescription, createAskOrchestratorHandler } from "./ask-orchestrator.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
@@ -329,8 +330,10 @@ function resultErrorText(message: SDKMessage): string {
 	return `Claude Code summary failed: ${result.subtype ?? "unknown result"}`;
 }
 
-function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function isolatedStreamFn(model: Model<any>, rawContext: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
+	// pi >= 0.86 hands over a TranscriptContext; see transcript-compat.ts
+	const context = toLegacyContext(rawContext) as Context;
 	void runIsolatedSummary(model, context, options, stream);
 	return stream;
 }
@@ -1125,8 +1128,10 @@ async function consumeQuery(
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
-function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
+	// pi >= 0.86 hands over a TranscriptContext; see transcript-compat.ts
+	const context = toLegacyContext(rawContext) as Context;
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1873,7 +1878,7 @@ export default function (pi: ExtensionAPI) {
 						model: params.model,
 						thinking: params.thinking,
 						isolated,
-						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
+						context: isolated ? undefined : withoutSystemMessages(buildSessionContext(ctx.sessionManager.getBranch()).messages) as Context["messages"],
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });

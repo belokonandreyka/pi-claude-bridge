@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Compat: pi 0.86 `TranscriptContext`** — pi 0.86 no longer passes `context.systemPrompt` / `context.tools` to custom `streamSimple` providers; the prompt and tool declarations live in `system` role entries inside `context.messages`, possibly amended mid-conversation. Both provider entry points (main stream and the isolated compaction summary) now convert through `toLegacyContext()` (`src/transcript-compat.ts`), which reads them with pi-ai's `getCurrentSystemPrompt()` / `getCurrentTools()` and strips `system` entries so the session cursor and the user/assistant/toolResult converters keep their indices. AskClaude's shared-session context is filtered the same way. On pi <= 0.85 the helpers are absent and the context passes through unchanged, so one build works on both sides of the upgrade.
+
 - **Add: forward global + project AGENTS.md** — Claude Code now receives both `~/.pi/agent/AGENTS.md` and the nearest project `AGENTS.md` (walking up from cwd), separated by `--- from <path> ---` provenance headers. Sanitizer runs per-body so headers (which may contain `~/.pi`, `pi-*` repo names) survive verbatim; fenced code blocks still pass through untouched. Single-source case emits no separator (byte-identical to prior output). Symlinked walk-ups that land on the global file are deduped via `realpath`.
 
 ## 0.6.2 — 2026-07-06
