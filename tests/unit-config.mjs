@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../src/config.js";
+import { readFileSync } from "node:fs";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { claudeCodeSettings, loadConfig, markStartupNoticeShown } from "../src/config.js";
 
 function withTempHome(fn) {
 	const oldHome = process.env.HOME;
@@ -19,6 +20,16 @@ function withTempHome(fn) {
 	}
 }
 
+describe("claudeCodeSettings", () => {
+	it("disables auto-memory by default", () => {
+		assert.deepEqual(claudeCodeSettings(), { autoMemoryEnabled: false });
+	});
+
+	it("allows auto-memory to be enabled", () => {
+		assert.deepEqual(claudeCodeSettings({ autoMemoryEnabled: true }), { autoMemoryEnabled: true });
+	});
+});
+
 describe("loadConfig", () => {
 	it("loads project config from Pi's configured project directory", () => withTempHome(() => {
 		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
@@ -31,6 +42,7 @@ describe("loadConfig", () => {
 			}));
 
 			assert.deepEqual(loadConfig(cwd), {
+				startupNoticeShown: undefined,
 				provider: { plan: "max" },
 				askClaude: { enabled: false },
 			});
@@ -42,7 +54,7 @@ describe("loadConfig", () => {
 	it("merges project config over global config", () => withTempHome((home) => {
 		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
 		try {
-			const globalDir = join(home, ".pi", "agent");
+			const globalDir = getAgentDir();
 			const projectDir = join(cwd, CONFIG_DIR_NAME);
 			mkdirSync(globalDir, { recursive: true });
 			mkdirSync(projectDir, { recursive: true });
@@ -51,61 +63,107 @@ describe("loadConfig", () => {
 				askClaude: { enabled: true, defaultMode: "read" },
 			}));
 			writeFileSync(join(projectDir, "claude-bridge.json"), JSON.stringify({
-				provider: { plan: "max" },
+				provider: { plan: "max", autoMemoryEnabled: true },
 				askClaude: { enabled: false },
 			}));
 
 			assert.deepEqual(loadConfig(cwd), {
-				provider: { plan: "max", strictMcpConfig: true },
+				startupNoticeShown: undefined,
+				provider: { plan: "max", strictMcpConfig: true, autoMemoryEnabled: true },
 				askClaude: { enabled: false, defaultMode: "read" },
 			});
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	}));
-});
 
-
-it("piAgentDir follows PI_CODING_AGENT_DIR and falls back to ~/.pi/agent", async () => {
-	const { piAgentDir } = await import("../src/config.ts");
-	assert.equal(piAgentDir({ PI_CODING_AGENT_DIR: "/tmp/pi-personal/agent", HOME: "/tmp/h" }), "/tmp/pi-personal/agent");
-	assert.equal(piAgentDir({ HOME: "/tmp/h" }), "/tmp/h/.pi/agent");
-});
-
-it("loadConfig and the global AGENTS.md come from the active profile, not ~/.pi/agent", async () => {
-	const os = await import("node:os");
-	const fs = await import("node:fs");
-	const path = await import("node:path");
-	const home = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-profile-"));
-	const work = path.join(home, ".pi", "agent");
-	const personal = path.join(home, ".pi-personal", "agent");
-	fs.mkdirSync(work, { recursive: true });
-	fs.mkdirSync(personal, { recursive: true });
-	fs.writeFileSync(path.join(work, "claude-bridge.json"), JSON.stringify({ provider: { plan: "pro" } }));
-	fs.writeFileSync(path.join(personal, "claude-bridge.json"), JSON.stringify({ provider: { plan: "max" } }));
-	fs.writeFileSync(path.join(work, "AGENTS.md"), "work rules");
-	fs.writeFileSync(path.join(personal, "AGENTS.md"), "personal rules");
-	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-cwd-"));
-	const saved = { HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
-	try {
-		process.env.HOME = home;
-		process.env.PI_CODING_AGENT_DIR = personal;
-		const { loadConfig } = await import("../src/config.ts");
-		const { resolveAgentsMdPath } = await import("../src/agents-md.ts");
-		assert.equal(loadConfig(cwd).provider.plan, "max");
-		const prevCwd = process.cwd();
-		process.chdir(cwd);
+	it("markStartupNoticeShown records today's date without dropping existing settings", () => withTempHome(() => {
+		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
 		try {
-			assert.equal(resolveAgentsMdPath(), path.join(personal, "AGENTS.md"));
+			const globalDir = getAgentDir();
+			mkdirSync(globalDir, { recursive: true });
+			const path = join(globalDir, "claude-bridge.json");
+			writeFileSync(path, JSON.stringify({
+				askClaude: { enabled: false },
+				provider: { strictMcpConfig: false },
+			}));
+
+			assert.equal(markStartupNoticeShown(), path);
+			const written = JSON.parse(readFileSync(path, "utf-8"));
+			assert.match(written.startupNoticeShown, /^\d{4}-\d{2}-\d{2}$/);
+			assert.deepEqual(written.askClaude, { enabled: false });
+			assert.deepEqual(written.provider, { strictMcpConfig: false });
+			assert.equal(loadConfig(cwd).startupNoticeShown, written.startupNoticeShown);
 		} finally {
-			process.chdir(prevCwd);
+			rmSync(cwd, { recursive: true, force: true });
 		}
-		delete process.env.PI_CODING_AGENT_DIR;
-		assert.equal(loadConfig(cwd).provider.plan, "pro");
-	} finally {
-		for (const [k, v] of Object.entries(saved)) {
-			if (v === undefined) delete process.env[k];
-			else process.env[k] = v;
+	}));
+
+	it("markStartupNoticeShown leaves an unparseable config untouched", () => withTempHome(() => {
+		const globalDir = getAgentDir();
+		mkdirSync(globalDir, { recursive: true });
+		const path = join(globalDir, "claude-bridge.json");
+		const malformed = '{ "askClaude": { "enabled": true }, }';
+		writeFileSync(path, malformed);
+
+		markStartupNoticeShown();
+		assert.equal(readFileSync(path, "utf-8"), malformed, "a typo must not cost the user their config");
+	}));
+
+	it("markStartupNoticeShown creates the config when there is none", () => withTempHome(() => {
+		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
+		try {
+			assert.equal(loadConfig(cwd).startupNoticeShown, undefined);
+			markStartupNoticeShown();
+			assert.match(loadConfig(cwd).startupNoticeShown, /^\d{4}-\d{2}-\d{2}$/);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
 		}
-	}
+	}));
+
+	it("emits askOrchestrator only when configured, project over global", () => withTempHome(() => {
+		const agentDir = mkdtempSync(join(tmpdir(), "claude-bridge-agent-"));
+		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
+		const oldEnv = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			assert.equal("askOrchestrator" in loadConfig(cwd), false);
+			writeFileSync(join(agentDir, "claude-bridge.json"), JSON.stringify({
+				askOrchestrator: { maxQuestions: 2, fallbackModel: "gateway/claude-haiku-4-5" },
+			}));
+			mkdirSync(join(cwd, CONFIG_DIR_NAME), { recursive: true });
+			writeFileSync(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"), JSON.stringify({
+				askOrchestrator: { maxQuestions: 5 },
+			}));
+			assert.deepEqual(loadConfig(cwd).askOrchestrator, { maxQuestions: 5, fallbackModel: "gateway/claude-haiku-4-5" });
+		} finally {
+			if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldEnv;
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	}));
+
+	it("resolves global config via PI_CODING_AGENT_DIR override, not hardcoded ~/.pi/agent", () => withTempHome(() => {
+		const agentDir = mkdtempSync(join(tmpdir(), "claude-bridge-agent-"));
+		const cwd = mkdtempSync(join(tmpdir(), "claude-bridge-project-"));
+		const oldEnv = process.env.PI_CODING_AGENT_DIR;
+		try {
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			writeFileSync(join(agentDir, "claude-bridge.json"), JSON.stringify({
+				provider: { plan: "max" },
+			}));
+
+			assert.deepEqual(loadConfig(cwd), {
+				startupNoticeShown: undefined,
+				provider: { plan: "max" },
+				askClaude: {},
+			});
+		} finally {
+			if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldEnv;
+			rmSync(agentDir, { recursive: true, force: true });
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	}));
 });

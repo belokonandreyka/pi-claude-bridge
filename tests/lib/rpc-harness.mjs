@@ -3,8 +3,9 @@
  * Provides spawn, send, event waiting, and text collection utilities.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { getClaudeDir } from "cc-session-io";
 import { fileURLToPath } from "node:url";
 import { StringDecoder } from "node:string_decoder";
 
@@ -14,6 +15,31 @@ const DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 // (`node --import tsx --test tests/int-foo.mjs`) and not just via `npm test`.
 const ENV_FILE = resolve(DIR, ".env.test");
 if (existsSync(ENV_FILE)) process.loadEnvFile(ENV_FILE);
+
+// Claude Code persists session state under its config dir. A sandbox that blocks
+// those writes lets the first query succeed and then fails the next turn's
+// --resume with "No conversation found with session ID", which reads like a
+// bridge bug. Surface the real cause up front.
+//
+// Resolve that dir the way the bridge and cc-session-io do, honouring
+// CLAUDE_CONFIG_DIR: probing a hardcoded ~/.claude reports a sandbox failure
+// when CLAUDE_CONFIG_DIR points somewhere writable, and misses a real one when
+// it points somewhere that isn't. Create it first so a fresh config dir reads
+// as writable rather than as a blocked write.
+// Per-pid name: `npm test` runs the int-*.mjs files concurrently, and a shared
+// probe path lets one process delete the file another is still using.
+const CLAUDE_DIR = getClaudeDir();
+const PROBE = resolve(CLAUDE_DIR, `.int-test-write-probe-${process.pid}`);
+try {
+	mkdirSync(CLAUDE_DIR, { recursive: true });
+	writeFileSync(PROBE, "");
+	rmSync(PROBE);
+} catch (err) {
+	throw new Error(
+		`Integration tests need write access to ${CLAUDE_DIR} for Claude Code session state (got ${err.code}). ` +
+			`Re-run outside the sandbox, or point CLAUDE_CONFIG_DIR at a writable directory.`,
+	);
+}
 
 /**
  * Create an RPC harness for pi integration tests.
@@ -38,6 +64,7 @@ export function createRpcHarness(opts) {
 	const cleanPath = process.env.PATH.split(":").filter((p) => !p.includes("node_modules")).join(":");
 
 	let pi, rpcLog;
+	let stopped = false;
 	let buffer = "";
 	let listeners = [];
 	let reqId = 0;
@@ -47,6 +74,7 @@ export function createRpcHarness(opts) {
 		// log see only this run's output, not accumulated history from prior
 		// failing runs. RPC log is still append so cross-run comparisons work.
 		writeFileSync(DEBUG_LOG, "");
+		stopped = false;
 		rpcLog = createWriteStream(RPC_LOG, { flags: "a" });
 		const spawnArgs = ["--no-session", "-ne", "-e", DIR, "--mode", "rpc", ...args];
 		pi = spawn("pi", spawnArgs, {
@@ -55,10 +83,13 @@ export function createRpcHarness(opts) {
 			env: { ...process.env, PATH: cleanPath, CLAUDE_BRIDGE_DEBUG: "1", CLAUDE_BRIDGE_DEBUG_PATH: DEBUG_LOG, ...env },
 		});
 
-		pi.stderr.on("data", (d) => rpcLog.write(d));
+		// The killed subprocess can still flush buffered stdout/stderr after stop()
+		// has ended rpcLog; guard writes so teardown doesn't throw write-after-end.
+		pi.stderr.on("data", (d) => { if (!stopped) rpcLog.write(d); });
 
 		const decoder = new StringDecoder("utf8");
 		pi.stdout.on("data", (chunk) => {
+			if (stopped) return;
 			buffer += decoder.write(chunk);
 			while (true) {
 				const i = buffer.indexOf("\n");
@@ -67,7 +98,7 @@ export function createRpcHarness(opts) {
 				buffer = buffer.slice(i + 1);
 				try {
 					const msg = JSON.parse(line);
-					rpcLog.write(`< ${line}\n`);
+					rpcLog?.write(`< ${line}\n`);
 					for (const fn of [...listeners]) fn(msg);
 				} catch {}
 			}
@@ -80,8 +111,14 @@ export function createRpcHarness(opts) {
 	}
 
 	function stop() {
+		stopped = true;
 		pi?.kill();
-		return new Promise((r) => rpcLog?.end(r));
+		// Drop the handle before ending it: pi can still emit a line or two after
+		// kill(), and writing to an ended stream throws asynchronously, which the
+		// test runner reports as a file-level failure.
+		const log = rpcLog;
+		rpcLog = null;
+		return new Promise((r) => (log ? log.end(r) : r()));
 	}
 
 	function addListener(fn) {
@@ -95,7 +132,7 @@ export function createRpcHarness(opts) {
 	function send(cmd, timeout = defaultTimeout) {
 		const id = `req_${++reqId}`;
 		const full = { ...cmd, id };
-		rpcLog.write(`> ${JSON.stringify(full)}\n`);
+		rpcLog?.write(`> ${JSON.stringify(full)}\n`);
 		pi.stdin.write(JSON.stringify(full) + "\n");
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => reject(new Error(`Timeout: ${cmd.type}`)), timeout);

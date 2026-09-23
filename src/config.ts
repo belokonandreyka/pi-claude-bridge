@@ -1,16 +1,18 @@
 // User-facing extension config. Loaded once at extension registration from
-// ~/.pi/agent/claude-bridge.json and the project Pi config directory, project
-// overriding global. Missing or unparseable files are ignored (error to
-// console.error, empty object returned) so the extension always starts.
+// the global agent dir (getAgentDir(), e.g. ~/.pi/agent/claude-bridge.json)
+// and the project Pi config directory, project overriding global. Missing or
+// unparseable files are ignored (error to console.error, empty object
+// returned) so the extension always starts.
 
 import type { SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { AskOrchestratorConfig } from "./ask-orchestrator.js";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 
 export interface Config {
+	/** Date (YYYY-MM-DD) the one-time startup notice was shown. Written by the extension, not the user. */
+	startupNoticeShown?: string;
 	askClaude?: {
 		enabled?: boolean;
 		name?: string;
@@ -25,18 +27,14 @@ export interface Config {
 	askOrchestrator?: AskOrchestratorConfig;
 	/** Low-level Claude Agent SDK plumbing. Most users won't need these. */
 	provider?: {
-		appendSystemPrompt?: boolean;
-		// Send Claude Code's full preset system prompt (default true). Setting
-		// this to false replaces it with a minimal prompt: the preset mostly
-		// describes Claude Code's own tools and behaviours, and this provider
-		// disables those (`tools: []`) because pi's tools arrive over MCP
-		// instead. Measured 2026-08-31 in vitu-portal/site/Scripts: the preset
-		// accounted for ~26k of a 44k cold start. Verify behaviour before
-		// relying on it — subscription requests may be sensitive to how the
-		// prompt looks.
-		systemPromptPreset?: boolean;
-		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
+		// Claude Code setting sources for the provider path. Unset leaves CC's
+		// default (every source), which also loads the user's and the project's
+		// skills and plugin skills into the prompt — measured 2026-08-31 in a
+		// large Angular repo at ~15k tokens per request. `[]` keeps them out;
+		// pi's own skills still arrive through the system-prompt append.
+		settingSources?: SettingSource[];
+		autoMemoryEnabled?: boolean;
 		pathToClaudeCodeExecutable?: string;
 		// Subscription plan tier. Setting to "max" enables Opus 4.6 at 1M context
 		plan?: "pro" | "max";
@@ -44,6 +42,9 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
+		// does not actually serve; pins them to the bare id at 200K.
+		forceTwoHundredK?: string[];
 	};
 }
 
@@ -57,25 +58,48 @@ export function tryParseJson(path: string): Partial<Config> {
 	}
 }
 
-/**
- * The Pi profile directory this session runs in. `mpi` switches it with
- * PI_CODING_AGENT_DIR; reading ~/.pi/agent regardless gave the personal profile
- * the work profile's bridge config and its AGENTS.md.
- */
-export function piAgentDir(env: NodeJS.ProcessEnv = process.env): string {
-	const fromEnv = env.PI_CODING_AGENT_DIR?.trim();
-	if (fromEnv) return fromEnv;
-	return join(env.HOME?.trim() || homedir(), ".pi", "agent");
+export function claudeCodeSettings(provider: Config["provider"] = {}): { autoMemoryEnabled: boolean } {
+	return { autoMemoryEnabled: provider.autoMemoryEnabled ?? false };
+}
+
+export function globalConfigPath(): string {
+	return join(getAgentDir(), "claude-bridge.json");
+}
+
+/** Record today's date in the global config so the startup notice shows once, preserving every
+ *  other field. Returns the config path for display either way.
+ *
+ *  Parses directly rather than through tryParseJson, which reports an unparseable file as `{}`:
+ *  spreading that would replace a user's whole config with just this marker the first time they
+ *  leave a trailing comma in it. Losing the notice is the cheaper failure, so the write is
+ *  skipped and the notice simply shows again next session. */
+export function markStartupNoticeShown(): string {
+	const path = globalConfigPath();
+	let existing: Partial<Config> = {};
+	if (existsSync(path)) {
+		try {
+			existing = JSON.parse(readFileSync(path, "utf-8"));
+		} catch (e) {
+			console.error(`claude-bridge: leaving ${path} alone, it does not parse: ${e}`);
+			return path;
+		}
+	}
+	// en-CA renders YYYY-MM-DD in local time; toISOString() would report UTC.
+	const next = { ...existing, startupNoticeShown: new Date().toLocaleDateString("en-CA") };
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`);
+	return path;
 }
 
 export function loadConfig(cwd: string): Config {
-	const global = tryParseJson(join(piAgentDir(), "claude-bridge.json"));
+	const global = tryParseJson(globalConfigPath());
 	const project = tryParseJson(join(cwd, CONFIG_DIR_NAME, "claude-bridge.json"));
 	// askOrchestrator is only emitted when actually configured: callers use
-	// optional chaining, and adding an always-present section would change the
-	// shape loadConfig has always returned.
+	// optional chaining, and an always-present section would change the shape
+	// loadConfig has always returned (and its tests compare it whole).
 	const askOrchestrator = { ...global.askOrchestrator, ...project.askOrchestrator };
 	return {
+		startupNoticeShown: project.startupNoticeShown ?? global.startupNoticeShown,
 		askClaude: { ...global.askClaude, ...project.askClaude },
 		...(Object.keys(askOrchestrator).length ? { askOrchestrator } : {}),
 		provider: { ...global.provider, ...project.provider },

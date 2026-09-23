@@ -1,40 +1,78 @@
-import { calculateCost, StringEnum, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
-import * as piAi from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
-import { buildSessionContext, compact, keyHint, type CompactionEntry, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
-import { Type } from "typebox";
+import { buildSessionContext, compact, generateBranchSummary, getAgentDir, keyHint, type BranchSummaryResult, type CompactionEntry, type ExtensionAPI, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { query, type EffortLevel, type SDKMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@earendil-works/pi-tui";
-import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
-import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
+import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
 import { QueryContext, ctx } from "./query-state.js";
-import { loadConfig, type Config, piAgentDir } from "./config.js";
-import { extractAgentsAppend } from "./agents-md.js";
-import { toLegacyContext, withoutSystemMessages } from "./transcript-compat.js";
+import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
+import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import { ASK_ORCHESTRATOR_PARAMETERS, ASK_ORCHESTRATOR_TOOL, AskOrchestratorState, askOrchestratorDescription, createAskOrchestratorHandler } from "./ask-orchestrator.js";
-import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
+import {
+	collectPromptSkills,
+	projectPromptCapture,
+	sharedPromptCaptures,
+} from "./prompt-capture.js";
+import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
+import { createToolServer, type McpToolDef } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
-
-// Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
-const _piAi = piAi as any;
-const newAssistantMessageEventStream: () => AssistantMessageEventStream =
-	typeof _piAi.createAssistantMessageEventStream === "function"
-		? _piAi.createAssistantMessageEventStream
-		: () => new _piAi.AssistantMessageEventStream();
+import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
+import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 
 // --- Debug logging ---
 // CLAUDE_BRIDGE_DEBUG=1 enables debug logging to ~/.pi/agent/claude-bridge.log
 
 const DEBUG = process.env.CLAUDE_BRIDGE_DEBUG === "1";
-const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(piAgentDir(), "claude-bridge.log");
-const DIAG_LOG_PATH = join(piAgentDir(), "claude-bridge-diag.log");
+// Logs live in the active profile (getAgentDir() follows PI_CODING_AGENT_DIR),
+// so two profiles do not interleave in one file.
+const DEBUG_LOG_PATH = process.env.CLAUDE_BRIDGE_DEBUG_PATH || join(getAgentDir(), "claude-bridge.log");
+const DIAG_LOG_PATH = join(getAgentDir(), "claude-bridge-diag.log");
+
+// CLAUDE_BRIDGE_RECORD_STREAM=<path> appends every SDK message consumeQuery sees,
+// one JSON object per line. Used by tests/lib/record-sdk-streams.mjs to capture
+// replay fixtures, so unit tests assert against message shapes Claude Code really
+// emitted rather than ones we imagined.
+const RECORD_STREAM_PATH = process.env.CLAUDE_BRIDGE_RECORD_STREAM;
+
+// Applied to every Claude Code subprocess the bridge spawns — provider, AskClaude
+// and the compact summary. One place, so a guard is added once rather than three
+// times, and so a missing one is visible.
+//
+// - ENABLE_CLAUDEAI_MCP_SERVERS=0: keep the user's claude.ai-connected MCP servers
+//   out of a pi session, which serves its own tools.
+// - DISABLE_AUTO_COMPACT=1: pi owns compaction; CC compacting its own copy would
+//   diverge from pi's history, which is the source of truth for every rebuild.
+const CC_CHILD_ENV = {
+	ENABLE_CLAUDEAI_MCP_SERVERS: "0",
+	DISABLE_AUTO_COMPACT: "1",
+	// pi sessions have their own rule infrastructure (skills with triggers, a
+	// composite AGENTS.md). The oh-my-claudecode plugin's Stop/UserPromptSubmit
+	// hooks (workflow-drift-guard nudging AskUserQuestion — a tool pi does not
+	// surface — skill-injector, rules-injector) duplicate that and are
+	// interactive-CC noise here. OMC stays active for native Claude Code.
+	DISABLE_OMC: "1",
+} as const;
+
+// Pi owns context files on the provider path, so Claude Code must not load its
+// own on top: otherwise a project CLAUDE.md arrives twice, and the user's
+// ~/.claude/CLAUDE.md — a persona written for a harness that is not the one
+// running — arrives at all, stamped "These instructions OVERRIDE any default
+// behavior" and outranking Pi's own AGENTS.md.
+//
+// Excludes rather than settingSources: the source gate that suppresses CLAUDE.md
+// is the same one that reads settings.json, where Bedrock/Vertex users keep
+// `env` and `apiKeyHelper`. Patterns are matched with picomatch against absolute
+// paths; "**/CLAUDE.md" covers the user, ancestor, project and .claude/ copies,
+// while rules need their own. Managed/policy memory is not excludable by design.
+const CLAUDE_MD_EXCLUDES = ["**/CLAUDE.md", "**/.claude/rules/**"];
 
 // Ensure log directories exist when debug is enabled
 if (DEBUG) {
@@ -97,22 +135,13 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
-//
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
-//
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
-//
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// Marks which bridge module instance owns the registered provider's stream fn.
+// Full registration policy (first vs later instances, shared vs own registry):
+// see the "--- Provider ---" block in activate() below.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
+// Claude Code's own builtin tools, for the AskClaude path where CC really runs
+// them. The provider path never sees these — it starts CC with `tools: []`.
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 	read: "read", write: "write", edit: "edit", bash: "bash",
 };
@@ -142,27 +171,13 @@ function errorMessage(err: unknown): string {
 // AskClaude mode presets — controls which CC tools are blocked per mode.
 // Only block tools that can't work (no pi TUI for user interaction).
 // Other CC tools (Agent, SendMessage, RemoteTrigger, Tasks, etc.) are intentionally not blocked.
-// Used instead of Claude Code's preset when `provider.systemPromptPreset` is
-// false. The preset is written for an agent driving Claude Code's own tools;
-// this provider disables those and supplies pi's over MCP, so most of it
-// describes a session the model is not in. What it still needs is who is
-// calling, where the tools come from, and that the appended AGENTS.md and
-// skills are the operating instructions.
-const MINIMAL_SYSTEM_PROMPT = `You are the model behind pi, a coding agent. You are called through pi's Claude bridge.
-
-Every tool available to you is provided by pi over MCP; there are no built-in file or shell tools. Use the tools you are given, and say so plainly when a task needs one you do not have.
-
-The instructions that follow are the operating context for this workspace. Treat them as binding, and prefer them over general habits when they conflict.`;
-
 const ASKCLAUDE_ALWAYS_BLOCKED = [
 	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
 	"ToolSearch", // probes for blocked tools, wastes tokens
 	"ScheduleWakeup", // no harness to fire wakeup from inside a delegated subagent
 ];
-const MODE_DISALLOWED_TOOLS: Record<string, string[]> = {
-	full: [
-		...ASKCLAUDE_ALWAYS_BLOCKED,
-	],
+const MODE_DISALLOWED_TOOLS: Record<AskClaudeMode, string[]> = {
+	full: ASKCLAUDE_ALWAYS_BLOCKED,
 	read: [
 		...ASKCLAUDE_ALWAYS_BLOCKED,
 		"Write", "Edit", "Bash", "NotebookEdit",
@@ -199,19 +214,43 @@ interface SessionState {
 	forceRotate?: boolean;
 }
 
+/**
+ * Claude Code's `@file` expansions from the session about to be replaced.
+ *
+ * Must be called before `deleteSession`, which wipes the file they live in —
+ * reading after it yields nothing, with no error to notice.
+ */
+function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachment[] {
+	try {
+		const previous = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		return collectCarriedAttachments(previous.records);
+	} catch (error) {
+		// A post-abort rebuild reads a file the killed CC subprocess may have been
+		// midway through writing, and cc-session-io parses each line with a bare
+		// JSON.parse, so a truncated last line throws. Throwing here would turn a
+		// lost attachment into a failed turn; carrying none is exactly what happened
+		// before this existed, so the failure mode is bounded by the status quo.
+		debug(`WARNING: could not read attachments from session ${sessionId.slice(0, 8)}:`, error);
+		return [];
+	}
+}
+
 let sharedSession: SessionState | null = null;
 
 // Convert pi messages to Anthropic API format for session import.
-// Lossy: non-Anthropic thinking blocks are dropped (no valid signature), and only
-// text/image/toolCall block types are handled. If all blocks in an assistant message
-// are filtered, the message is dropped — which can create invalid sequences (e.g.
-// two user messages in a row, or tool_result without preceding tool_use).
+// Lossy: only text, thinking and toolCall blocks survive, and thinking only when
+// Claude Code itself minted the signature. An assistant message whose blocks all
+// filter out keeps its slot with a placeholder, since dropping it can create a
+// tool_result with no preceding tool_use. A turn aborted before anything streamed
+// is dropped instead — it never had content, and inventing one diverges from the
+// prefix Claude Code cached.
 function convertAndImportMessages(
 	session: ReturnType<typeof createSession>,
 	messages: Context["messages"],
 	customToolNameToSdk?: Map<string, string>,
+	carried?: readonly CarriedAttachment[],
 ): void {
-	const { anthropicMessages, sanitizedIds } = convertPiMessages(messages, customToolNameToSdk);
+	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk);
 
 	debug(`convertAndImportMessages: ${messages.length} pi msgs → ${anthropicMessages.length} anthropic msgs`);
 	debug(`convertAndImportMessages: imported roles:`, anthropicMessages.map((m, i) => {
@@ -220,6 +259,16 @@ function convertAndImportMessages(
 		if (Array.isArray(c)) return `[${i}]${m.role}:${(c).map((b) => b.type).join("+")}`;
 		return `[${i}]${m.role}:?`;
 	}).join(" "));
+	// The roles line above shows only what survived, so a stripped block is
+	// indistinguishable there from one that never existed. Name the losses.
+	const droppedParts = [
+		dropped.thinking ? `${dropped.thinking} thinking (${[...dropped.providers].sort().join(", ")})` : "",
+		dropped.abortedTurns ? `${dropped.abortedTurns} aborted turn(s)` : "",
+		...[...dropped.other].map(([type, n]) => `${n} ${type}`),
+	].filter(Boolean);
+	if (droppedParts.length > 0) {
+		debug(`convertAndImportMessages: dropped ${droppedParts.join(", ")}`);
+	}
 	if (sanitizedIds.size > 0) {
 		debug(`convertAndImportMessages: sanitized ${sanitizedIds.size} tool IDs:`,
 			[...sanitizedIds.entries()].map(([orig, clean]) => orig === clean ? orig : `${orig}→${clean}`).join(", "));
@@ -229,7 +278,21 @@ function convertAndImportMessages(
 	if (repaired.length !== anthropicMessages.length) {
 		debug(`convertAndImportMessages: repairToolPairing ${anthropicMessages.length} → ${repaired.length} msgs`);
 	}
-	if (repaired.length) session.importMessages(repaired);
+	// Placement runs against the repaired array because that is the index space
+	// importMessages reads. Attachments are links in CC's uuid chain, so they have
+	// to be written in order with the messages, not appended afterwards.
+	const placed = carried?.length
+		? placeCarriedAttachments(carried, repaired as unknown as { role: string; content: unknown }[])
+		: undefined;
+	if (placed?.skipped.length) {
+		debug(`convertAndImportMessages: dropped ${placed.skipped.length} carried attachment(s): ${placed.skipped.join("; ")}`);
+	}
+	if (placed?.attachments.length) {
+		debug(`convertAndImportMessages: carrying ${placed.attachments.length} attachment(s) across the rebuild`);
+	}
+	if (repaired.length) {
+		session.importMessages(repaired, placed?.attachments.length ? { attachments: placed.attachments } : undefined);
+	}
 }
 
 // Pi doesn't pass tool results directly — it appends them to the context and calls
@@ -245,55 +308,79 @@ function extractAllToolResults(context: Context): McpResult[] {
 	return results;
 }
 
-/** Extract the last user message from context as a prompt string. Returns null if last message is not a user message. */
-function extractUserPrompt(messages: Context["messages"]): string | null {
-	const last = messages[messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	if (typeof last.content === "string") return last.content;
-	return messageContentToText(last.content) || "";
+/** Index of the first message of the current user turn — the trailing run of
+ *  user messages that has not been written into the Claude Code session yet.
+ *  Equals messages.length when the last message is not a user message.
+ *
+ *  Single source of truth for the history/prompt split: everything before this
+ *  index is replayed as session history, everything from it onward becomes the
+ *  prompt. Deriving both halves from one index is what keeps a message from
+ *  landing in both — an extension appending a display-only user message after
+ *  the real one (see issue #34) makes the turn longer than one message. */
+function turnStart(messages: Context["messages"]): number {
+	let i = messages.length;
+	while (i > 0 && messages[i - 1].role === "user") i--;
+	return i;
 }
 
-/** Extract the last user message as ContentBlockParam[] (preserving images).
+/** Extract the current user turn as a prompt string. Returns null if the last message is not a user message. */
+function extractUserPrompt(messages: Context["messages"]): string | null {
+	const turn = messages.slice(turnStart(messages)) as UserMessage[];
+	if (turn.length === 0) return null;
+	// Drop empties before joining so an all-empty turn still yields "" and trips
+	// the caller's empty-prompt guard rather than sending bare newlines.
+	return turn
+		.map((m) => (typeof m.content === "string" ? m.content : messageContentToText(m.content)))
+		.filter((text) => text)
+		.join("\n");
+}
+
+/** Extract the current user turn as ContentBlockParam[] (preserving images).
  *  Returns null if no images — caller should fall back to string prompt. */
 function extractUserPromptBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
-	const last = messages[messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	if (typeof last.content === "string") {
-		debug(`extractUserPromptBlocks: content is string (length=${last.content.length})`);
-		return null;
-	}
-	if (!Array.isArray(last.content)) {
-		debug(`extractUserPromptBlocks: content is ${typeof last.content}`);
-		return null;
-	}
-	debug(`extractUserPromptBlocks: ${last.content.length} blocks, types=${last.content.map((b: any) => b.type).join(",")}`);
+	const turn = messages.slice(turnStart(messages)) as UserMessage[];
+	if (turn.length === 0) return null;
+
 	let hasImage = false;
 	const blocks: ContentBlockParam[] = [];
-	for (const block of last.content) {
-		if (block.type === "text" && block.text) {
-			blocks.push({ type: "text", text: block.text });
-		} else if (block.type === "image") {
-			debug(`image block: mimeType=${(block as any).mimeType}, data length=${((block as any).data ?? "").length}, keys=${Object.keys(block).join(",")}`);
-			if (!(block as any).data || !(block as any).mimeType) {
-				debug(`image block missing data or mimeType, skipping`);
-				continue;
+	for (const message of turn) {
+		const content: (TextContent | ImageContent)[] = typeof message.content === "string"
+			? [{ type: "text", text: message.content }]
+			: message.content;
+		// Off-type content violates UserMessage's contract, so fail rather than
+		// degrade — but name the shape, since the cause is almost always another
+		// extension appending a malformed message, not this file.
+		if (!Array.isArray(content)) {
+			throw new Error(
+				`extractUserPromptBlocks: user message content must be a string or block array, got ${typeof content} — likely a malformed message from another extension`,
+			);
+		}
+		for (const block of content) {
+			if (block.type === "text" && block.text) {
+				blocks.push({ type: "text", text: block.text });
+			} else if (block.type === "image") {
+				// Guard before logging: data-less image blocks do occur, and reading
+				// .length off the missing field in the debug template would throw
+				// before this check ever runs (template args evaluate unconditionally).
+				if (!block.data || !block.mimeType) {
+					debug(`image block missing data or mimeType, skipping: keys=${Object.keys(block).join(",")}`);
+					continue;
+				}
+				debug(`image block: mimeType=${block.mimeType}, data length=${block.data.length}`);
+				hasImage = true;
+				blocks.push({
+					type: "image",
+					source: {
+						type: "base64",
+						media_type: block.mimeType as Base64ImageSource["media_type"],
+						data: block.data,
+					},
+				});
 			}
-			hasImage = true;
-			blocks.push({
-				type: "image",
-				source: { type: "base64", media_type: block.mimeType as Base64ImageSource["media_type"], data: block.data },
-			});
 		}
 	}
+	debug(`extractUserPromptBlocks: ${turn.length} msgs in turn, ${blocks.length} blocks, types=${blocks.map((b) => b.type).join(",")}`);
 	return hasImage ? blocks : null;
-}
-
-async function* wrapPromptStream(blocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
-	yield {
-		type: "user",
-		message: { role: "user", content: blocks } as MessageParam,
-		parent_tool_use_id: null,
-	};
 }
 
 function newAssistantOutput(model: Model<any>, text: string, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
@@ -323,17 +410,37 @@ function extractIsolatedSummaryPrompt(messages: Context["messages"]): string {
 	return promptText;
 }
 
-function resultErrorText(message: SDKMessage): string {
-	const result = message as SDKMessage & { subtype?: string; errors?: unknown; error?: unknown };
-	if (Array.isArray(result.errors)) return result.errors.map(String).join("\n");
+/** Failure text for an SDK result, or undefined when it succeeded. CC reports API failures
+ *  (429 capacity, overload, prompt-too-long) with `is_error` on an otherwise success-shaped
+ *  result; the dedicated error subtypes carry `errors` instead. */
+function resultErrorText(message: SDKMessage): string | undefined {
+	const result = message as SDKMessage & { subtype?: string; is_error?: boolean; result?: string; errors?: unknown; error?: unknown };
+	if (result.subtype === "success") return result.is_error ? result.result || "Claude Code reported an error" : undefined;
+	if (Array.isArray(result.errors) && result.errors.length) return result.errors.map(String).join("\n");
 	if (typeof result.error === "string") return result.error;
-	return `Claude Code summary failed: ${result.subtype ?? "unknown result"}`;
+	return `Claude Code failed: ${result.subtype ?? "unknown result"}`;
 }
 
-function isolatedStreamFn(model: Model<any>, rawContext: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = newAssistantMessageEventStream();
-	// pi >= 0.86 hands over a TranscriptContext; see transcript-compat.ts
-	const context = toLegacyContext(rawContext) as Context;
+/** Name a failure as a rate limit when a rejection preceded it.
+ *
+ *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
+ *  is `errorMessage` — so everything that reacts to a rate limit pattern-matches that string:
+ *  pi-subagents gates `fallbackModels` on its own pattern list, and key-rotating extensions use
+ *  their own. Claude Code words a subscription limit as "You're out of extra usage · resets
+ *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
+ *  fallback chain never runs (issue #58).
+ *
+ *  Leading with "Claude rate limit" rather than appending keeps the phrase in any truncated
+ *  render, and avoids the `<tool> failed (exit N):` shape that pi-subagents treats as a tool
+ *  failure and refuses to retry. */
+function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
+	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
+	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
+	return `Claude rate limit${kind}${resets}: ${failure}`;
+}
+
+function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream);
 	return stream;
 }
@@ -344,6 +451,11 @@ async function runIsolatedSummary(
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
+	// pi delivers compaction/branch-summary requests as a transcript: the summarization
+	// prompt folded into a leading system message ahead of the lone user message
+	// (issue #106). toBridgeContext restores the prompt/tools fields the extraction
+	// assertion below assumes; the summarization prompt still reaches CC as its systemPrompt.
+	context = toBridgeContext(context);
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	let wasAborted = false;
 	const onAbort = () => {
@@ -353,9 +465,19 @@ async function runIsolatedSummary(
 	};
 
 	try {
-		const promptText = extractIsolatedSummaryPrompt(context.messages);
-		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-		const claudeExecutable = loadConfig(cwd).provider?.pathToClaudeCodeExecutable;
+		// One-off summarizer calls (compaction, branch summary, turn prefix, bug report —
+		// anything routed through pi's completeSummarization) are marked cacheRetention:
+		// "none". Any of them may appear in a future pi release without a bridge change,
+		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
+		// must still match the [system,user] compaction shape exactly.
+		const isOneOffSummary = options?.cacheRetention === "none";
+		const promptText = isOneOffSummary
+			? extractUserPrompt(context.messages)
+			: extractIsolatedSummaryPrompt(context.messages);
+		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
+		const cwd = process.cwd();
+		const compactProviderSettings = loadConfig(cwd).provider;
+		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
 		const cliModel = claudeCodeModelId(model, longContextSettings);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
@@ -363,7 +485,8 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: { ...process.env, DISABLE_AUTO_COMPACT: "1", CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1" },
+				env: { ...process.env, ...CC_CHILD_ENV },
+				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
 				settingSources: [] as SettingSource[],
@@ -400,11 +523,8 @@ async function runIsolatedSummary(
 				}
 			} else if (message.type === "result") {
 				logServedContextWindow("compact summary", message, model);
-				if (message.subtype === "success") {
-					finalText = message.result || assistantText;
-				} else {
-					errorText = resultErrorText(message);
-				}
+				errorText = resultErrorText(message);
+				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
 			}
 		}
 
@@ -537,7 +657,11 @@ function syncSharedSession(
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
 ): SyncResult {
-	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
+	// System messages are pi's transcript representation of prompt and tool state, not
+	// conversation history — they are never imported into a CC session, so exclude them from
+	// the history space (priorMessages, cursor, missed) everywhere below (issue #106).
+	const history = nonSystemMessages(messages);
+	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
 	// REUSE path
 	//
@@ -559,10 +683,20 @@ function syncSharedSession(
 			return { sessionId: sharedSession.sessionId };
 		}
 	}
+	// This is what keeps a reentrant subagent from taking over the parent's
+	// session: a subagent starts with priors of its own, shorter than the parent's
+	// cursor, so it lands here, gets a fresh session, and the ephemeral session it
+	// captures is deleted once its query completes (see preserveSharedSession in
+	// the completion handler). Remove this branch and a subagent resumes — then
+	// overwrites — the parent's session. The non-isolated AskClaude path reaches it
+	// the same way.
+	//
+	// It is NOT, despite an earlier comment here, the isolated compact-summary
+	// path: runIsolatedSummary never calls syncSharedSession at all.
+	//
 	// Only reachable when needsRebuild is false — user-facing history rewrites
 	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call. In practice this
-	// fires only for isolated compact-summary subprocesses.
+	// sharedSession before the next syncSharedSession call.
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
 		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
 		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
@@ -571,7 +705,7 @@ function syncSharedSession(
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${messages.length} total messages`);
+		debug(`Case 1: clean start, ${history.length} total messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
@@ -582,6 +716,8 @@ function syncSharedSession(
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
 	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
+	// Before deleteSession — it wipes the file these live in.
+	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
 		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
@@ -592,17 +728,19 @@ function syncSharedSession(
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		...(modelId ? { model: modelId } : {}),
 	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk);
+	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
 	session.save();
-	verifyWrittenSession(session.jsonlPath, session.sessionId, session.messages.length, cwd);
+	// records, not messages: `messages` filters out the attachment records that
+	// carrying an `@file` expansion across a rebuild writes into the same file.
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
 	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
 	if (previousSessionId === undefined) {
-		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.messages.length} records`);
+		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
 		const missedCount = priorMessages.length - previousCursor;
-		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.messages.length} records`);
+		debug(`Case 4: ${missedCount} missed messages, ${priorMessages.length} total → rewrote session ${session.sessionId.slice(0, 8)} (same id), ${session.records.length} records`);
 	} else {
-		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.messages.length} records`);
+		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
 	}
 	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
@@ -620,21 +758,47 @@ export const __test = {
 	getSharedSession() {
 		return sharedSession;
 	},
+	setPiUI(ui: ExtensionUIContext | null) {
+		piUI = ui;
+	},
+	toBridgeContext,
 	syncSharedSession,
+	extractUserPromptBlocks,
+	consumeQuery,
+	finalizeCurrentStream,
+	resultErrorText,
+	deliverToolResults,
+	drainForAbort,
+	CC_CHILD_ENV,
+	buildMcpServers,
+	branchSummaryOutcome,
+	get promptCaptures() {
+		return promptCaptures;
+	},
 };
 
 // --- Provider helpers: tool name mapping ---
 
-function mapToolName(name: string, customToolNameToPi?: Map<string, string>): string {
+// AskClaude path: CC runs its own tools, so builtin names are real.
+function mapToolName(name: string): string {
 	const normalized = name.toLowerCase();
 	const builtin = SDK_TO_PI_TOOL_NAME[normalized];
 	if (builtin) return builtin;
-	if (customToolNameToPi) {
-		const mapped = customToolNameToPi.get(name) ?? customToolNameToPi.get(normalized);
-		if (mapped) return mapped;
-	}
 	if (normalized.startsWith(MCP_TOOL_PREFIX)) return name.slice(MCP_TOOL_PREFIX.length);
 	return name;
+}
+
+// Provider path: the query runs with `tools: []`, so the only tools CC can
+// legitimately call are the pi tools we serve over MCP. Any other name is the
+// model hallucinating a builtin (`bash`, `Bash`, `Edit`, an MCP server we don't
+// serve). CC answers those itself with "No such tool available" and retries
+// inside the same query, never dispatching them to our MCP server — so a tool
+// call under such a name must not reach pi. Forwarding one ran a tool CC never
+// dispatched (real side effects) and, because the retry carries a fresh
+// tool_use id, left the handler for the retry with no result to release it:
+// pi's result arrived keyed to the dead id, and both sides deadlocked.
+function piToolNameFor(name: string, customToolNameToPi: Map<string, string>): string | undefined {
+	return customToolNameToPi.get(name) ?? customToolNameToPi.get(name.toLowerCase());
 }
 
 // Renames for Claude Code SDK param names that differ from pi's native names.
@@ -664,10 +828,6 @@ function mapToolArgs(
 	return result;
 }
 
-// --- Provider helpers: tool resolution ---
-
-// --- Provider helpers: tool bridge ---
-
 // --- Query state ---
 // QueryContext lives in query-state.js so tests can import it without
 // activating the extension.
@@ -675,16 +835,89 @@ function mapToolArgs(
 // Global (not query state):
 let piUI: ExtensionUIContext | null = null;
 
-// Bridge-internal tool: Claude may call it, pi must never see the call.
-// askOrchestratorSdkName is what appears in tool_use blocks, and is what the
-// two filters below key on.
+// Bridge-internal tool: Claude may call it, pi never sees the call. It is served
+// by the bridge's own MCP server, and because its SDK name is not in
+// customToolNameToPi, piToolNameFor() leaves it out of the turn blocks on both
+// the stream and the batch path — the same skip that hides unserved tools.
 let bridgeConfig: Config | null = null;
-let askOrchestratorToolName = ASK_ORCHESTRATOR_TOOL;
-let askOrchestratorSdkName = `${MCP_TOOL_PREFIX}${ASK_ORCHESTRATOR_TOOL}`;
-function isAskOrchestratorCall(name: unknown): boolean {
-	return typeof name === "string" && name === askOrchestratorSdkName;
-}
+let piMode: ExtensionContext["mode"] | null = null;
 const activeQueryContexts = new Set<QueryContext>();
+
+// Defaults that silently cost the user something (no Opus 1M on Max, no
+// AskClaude tool) are announced once. Deferred to the first bridge query rather
+// than session_start: the notice persists a flag to the global config, and
+// firing it on startup would write that file for every pi session that merely
+// has this extension installed. One message, because consecutive info notifies
+// overwrite each other in the TUI.
+let pendingNotices: string[] = [];
+
+function showStartupNoticeOnce(): void {
+	// `hasUI` is true in RPC mode too — it means dialogs are possible, not that a
+	// human is watching. Only a terminal user can act on this.
+	if (pendingNotices.length === 0 || piMode !== "tui") return;
+	const notices = pendingNotices;
+	pendingNotices = [];
+	const path = markStartupNoticeShown();
+	// pi wraps the whole notify string in the theme's dim foreground; the inner reset
+	// drops back to the terminal default rather than dim, which is fine here.
+	const title = `\x1b[33mWelcome to pi-claude-bridge\x1b[39m — settings live in ${path}`;
+	const bullets = [...notices, "This message only appears once. See README.md for more."].map((n) => `• ${n}`);
+	piUI?.notify([title, ...bullets, "─".repeat(64)].join("\n"), "info");
+}
+
+// Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
+// is keyed rather than held in a single slot. One process-wide instance, shared
+// across every extension module instance: isolated subagents re-evaluate this
+// module, and the pinned stream they all route through resolves against it.
+const promptCaptures = sharedPromptCaptures((diagnostic) => {
+	const first = diagnostic.matches[0];
+	debug(
+		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
+		+ (first
+			? `closest known (${first.key.length}-char) shares its first ${first.firstDivergent} chars and diverges at offset ${first.firstDivergent}: `
+			  + JSON.stringify(diagnostic.systemPrompt.slice(first.firstDivergent - 40, first.firstDivergent + 60))
+			: "no known captures to compare against."
+		) + ` known keys=${diagnostic.matches.length}`,
+	);
+});
+
+/** Whatever a settled session left behind, named in one greppable line.
+ *
+ *  Every one of these should be empty once the last turn ends, and each is a leak
+ *  that costs something real: a retained context routes a later orphaned tool result
+ *  into the delivery path and returns a stream nobody ends; a pending tool call is an
+ *  MCP handler Claude Code is still waiting on; a live prompt stream is an unresolved
+ *  ack. The activeQueryContexts leak was present on every single happy-path run and
+ *  no test noticed, because nothing asserted that anything ends clean — so assert it
+ *  where the real sessions are, and let diag/audit-warnings.mjs scan for it. */
+function reportLeaks(label: string): void {
+	const pendingCalls = [...activeQueryContexts].reduce((n, c) => n + c.pendingToolCalls.size, 0);
+	const liveStreams = [...activeQueryContexts].filter((c) => c.promptStream !== null).length;
+	if (activeQueryContexts.size === 0 && pendingCalls === 0 && liveStreams === 0) return;
+	debug(
+		`WARNING: ${label} left state behind — contexts=${activeQueryContexts.size} `
+		+ `pendingToolCalls=${pendingCalls} promptStreams=${liveStreams}`,
+	);
+}
+
+/** What pi's branch summary means for the navigation it was asked for.
+ *
+ *  Cancelling on failure matches pi's own path, which rethrows a summary error out
+ *  of the navigation rather than moving without one. Separated from the event
+ *  handler so this decision is testable without a Claude Code subprocess — driving
+ *  `generateBranchSummary` itself would only be testing pi. */
+function branchSummaryOutcome(result: BranchSummaryResult): { cancel: true } | { summary: { summary: string; details: unknown; usage?: BranchSummaryResult["usage"] } } {
+	if (result.aborted) return { cancel: true };
+	if (result.error) throw new Error(result.error);
+	debug(`session_before_tree: takeover complete summaryLen=${result.summary?.length ?? 0}`);
+	return {
+		summary: {
+			summary: result.summary ?? "",
+			details: { readFiles: result.readFiles ?? [], modifiedFiles: result.modifiedFiles ?? [] },
+			usage: result.usage,
+		},
+	};
+}
 
 function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	for (const result of results) {
@@ -725,19 +958,21 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
-// Handlers are assigned toolCallIds from turnToolCallIds (populated when the SDK
-// emits tool_use blocks). Results are matched by ID, not position.
+// Handlers receive their toolCallId from Claude's tools/call _meta, so results
+// are matched by ID end to end.
+//
+// The handler and pi's result can arrive in either order, hence the two maps:
+// a result that lands first waits in `pendingResults` for the handler to claim
+// it, and a handler that runs first parks its resolver in `pendingToolCalls`.
 // Handlers close over the captured `queryCtx`, ensuring they operate on the
 // correct query's state while multiple queries run concurrently.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
-	const mcpTools = tools.map((tool) => ({
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string): Record<string, ReturnType<typeof createToolServer>> | undefined {
+	const mcpTools: McpToolDef[] = tools.map((tool) => ({
 		name: tool.name,
 		description: tool.description,
-		inputSchema: jsonSchemaToZodShape(tool.parameters),
-		handler: async () => {
-			const toolCallId = queryCtx.turnToolCallIds[queryCtx.nextHandlerIdx++];
-			if (!toolCallId) debug(`WARNING: mcp handler ${tool.name} has no toolCallId (idx=${queryCtx.nextHandlerIdx - 1}, available=${queryCtx.turnToolCallIds.length})`);
-			if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
+		inputSchema: tool.parameters,
+		handler: async (toolCallId: string) => {
+			if (queryCtx.pendingResults.has(toolCallId)) {
 				const result = queryCtx.pendingResults.get(toolCallId)!;
 				queryCtx.pendingResults.delete(toolCallId);
 				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
@@ -760,14 +995,14 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext, brief?: string):
 			getDelegationBrief: () => brief,
 		});
 		mcpTools.push({
-			name: askOrchestratorToolName,
+			name: ASK_ORCHESTRATOR_TOOL,
 			description: askConf?.description ?? askOrchestratorDescription(),
-			inputSchema: jsonSchemaToZodShape(ASK_ORCHESTRATOR_PARAMETERS as unknown as Record<string, unknown>),
-			handler: async (args: Record<string, unknown>) => askHandler(args, askState),
-		} as (typeof mcpTools)[number]);
+			inputSchema: ASK_ORCHESTRATOR_PARAMETERS,
+			handler: async (_toolCallId, args) => askHandler(args, askState) as Promise<McpResult>,
+		});
 	}
-	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
-	return { [MCP_SERVER_NAME]: server };
+	if (!mcpTools.length) return undefined;
+	return { [MCP_SERVER_NAME]: createToolServer(MCP_SERVER_NAME, mcpTools) };
 }
 
 // --- Usage helpers ---
@@ -777,9 +1012,9 @@ function updateUsage(output: AssistantMessage, usage: Record<string, number | un
 	if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
 	if (usage.cache_read_input_tokens != null) output.usage.cacheRead = usage.cache_read_input_tokens;
 	if (usage.cache_creation_input_tokens != null) output.usage.cacheWrite = usage.cache_creation_input_tokens;
-	// Claude Code may report reasoning/thinking tokens separately, while pi's Usage type does not model that field.
+	// Claude Code may report reasoning/thinking tokens separately from output tokens.
 	const reasoning = usage.reasoning_tokens ?? usage.thinking_tokens;
-	if (reasoning != null) (output.usage as typeof output.usage & { reasoning?: number }).reasoning = reasoning;
+	if (reasoning != null) output.usage.reasoning = reasoning;
 	output.usage.totalTokens = output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 	calculateCost(model, output.usage);
 	const promptTokens = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
@@ -808,6 +1043,8 @@ function logServedContextWindow(label: string, message: SDKMessage, model: Model
 const REASONING_TO_EFFORT: Record<string, EffortLevel> = {
 	minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "max",
 };
+
+const VALID_EFFORTS = new Set<string>(["low", "medium", "high", "xhigh", "max"]);
 
 // --- Provider helpers: misc ---
 
@@ -864,9 +1101,13 @@ function finalizeCurrentStream(c: QueryContext, stopReason?: string): void {
 	if (!c.currentPiStream || !c.turnOutput) return;
 	debug(`provider: finalizeCurrentStream called, stopReason=${stopReason}, turnOutput=${JSON.stringify({stopReason: c.turnOutput!.stopReason, error: c.turnOutput!.errorMessage})}`);
 	if (!c.turnStarted) ensureTurnStarted(c);
-	const reason = stopReason === "length" ? "length" : "stop";
 	const stream = c.currentPiStream;
-	stream!.push({ type: "done", reason, message: c.turnOutput });
+	if (c.turnOutput.stopReason === "error") {
+		stream!.push({ type: "error", reason: "error", error: c.turnOutput });
+	} else {
+		const reason = stopReason === "length" ? "length" : "stop";
+		stream!.push({ type: "done", reason, message: c.turnOutput });
+	}
 	markStreamComplete(stream);
 	stream!.end();
 	c.currentPiStream = null;
@@ -885,8 +1126,13 @@ function processStreamEvent(
 	const event = (message as SDKMessage & { event: any }).event;
 
 	if (event?.type === "message_start") {
+		// Still open from an earlier message_start: Claude Code gave up on that
+		// stream and is retrying it. Its blocks were never completed.
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `restreamed as ${event.message?.id}`);
 		c.turnToolCallIds = [];
-		c.nextHandlerIdx = 0;
+		c.turnStreamMessageId = event.message?.id;
+		c.turnStreamOpen = true;
+		c.turnStreamBlockStart = c.turnBlocks.length;
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
 	}
@@ -900,19 +1146,16 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "tool_use") {
-			// Bridge-internal question tool: keep it out of both the id list and
-			// turnBlocks. Deltas and content_block_stop for this index then no-op
-			// via their own `if (!block) return`, because those look the block up
-			// by its stored `index`, not by array position.
-			if (isAskOrchestratorCall(event.content_block.name)) {
-				debug(`askOrchestrator: hiding tool_use ${event.content_block.id} from pi`);
+			const piName = piToolNameFor(event.content_block.name, customToolNameToPi);
+			if (!piName) {
+				debug(`processStreamEvent: skipping tool_use for unserved tool ${event.content_block.name} [${event.content_block.id}] — CC rejects it and retries`);
 				return;
 			}
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(event.content_block.id);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
-				name: mapToolName(event.content_block.name, customToolNameToPi),
+				name: piName,
 				arguments: (event.content_block.input as Record<string, unknown>) ?? {},
 				partialJson: "", index: event.index,
 			});
@@ -971,6 +1214,8 @@ function processStreamEvent(
 		return;
 	}
 
+	if (event?.type === "message_stop") c.turnStreamOpen = false;
+
 	if (event?.type === "message_stop" && c.turnSawToolCall) {
 		// Tool call complete — end this pi stream. The SDK will still yield an
 		// assistant message for this turn, but currentPiStream=null causes
@@ -993,18 +1238,47 @@ function processStreamEvent(
 	}
 }
 
+/** Remove the blocks a stream Claude Code abandoned mid-message. They never got a
+ *  message_stop, so a thinking block has no signature and a tool call is one CC will
+ *  never dispatch; left in, pi would run the tool and the turn would wait on a
+ *  handler that never comes, or the next request would replay a broken block.
+ *  The fallback then restarts those indices. pi's normal provider path tolerates that;
+ *  pi-agent-core's experimental harness frame encoder keys blocks by contentIndex and
+ *  rejects a repeated start, so it would need a change there to drive this provider. */
+function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
+	const dropped = c.turnBlocks.splice(c.turnStreamBlockStart);
+	debug(`dropAbandonedStreamBlocks: ${why}; dropped ${dropped.length} blocks from ${c.turnStreamMessageId} types=${dropped.map((b: any) => b.type).join(",")}`);
+	c.turnToolCallIds = [];
+	c.turnSawToolCall = c.turnBlocks.some((b: any) => b.type === "toolCall");
+	c.turnStreamOpen = false;
+}
+
 // The SDK always yields `assistant` messages (completed content blocks) after streaming.
 // When stream_events already delivered the content, this is a no-op. But after
 // resetTurnState (e.g. tool result delivery), if the next turn's assistant message
 // arrives before any stream_events, this is the primary content path. Must maintain
 // the same stream lifecycle as processStreamEvent — including ending the stream on
 // tool_use to prevent deadlock with the MCP handler.
+//
+// It is also the content path when a stream stalls: Claude Code drops it and asks
+// again without streaming ("Error streaming, falling back to non-streaming mode"),
+// and the answer arrives as one assistant message, under a new message id, with no
+// stream_events of its own. turnSawStreamEvent is already set by the dead stream,
+// so gating on it alone dropped that message: its tool calls never reached pi, CC
+// sat in the MCP handler waiting for their results, and the turn hung on "Working"
+// until the user aborted it.
 function processAssistantMessage(message: SDKMessage, model: Model<any>, customToolNameToPi: Map<string, string>, c: QueryContext): void {
-	if (c.turnSawStreamEvent) return;
 	const assistantMsg = (message as any).message;
 	if (!assistantMsg?.content) return;
+	if (c.turnSawStreamEvent) {
+		// Same id was already delivered; a new id is CC's non-streaming fallback.
+		// Drop the stalled stream's partial blocks if it never stopped. Deliberately
+		// deliver even if it stopped, at the risk of duplication if CC renumbers it.
+		const id = assistantMsg.id;
+		if (!id || !c.turnStreamMessageId || id === c.turnStreamMessageId) return;
+		if (c.turnStreamOpen) dropAbandonedStreamBlocks(c, `non-streaming fallback ${id}`);
+	}
 	c.turnToolCallIds = [];
-	c.nextHandlerIdx = 0;
 	debug(`processAssistantMessage fallback: ${assistantMsg.content.length} blocks, types=${assistantMsg.content.map((b: any) => b.type).join(",")}`);
 	for (const block of assistantMsg.content) {
 		if (block.type === "text" && block.text) {
@@ -1022,18 +1296,18 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
 		} else if (block.type === "tool_use") {
-			if (isAskOrchestratorCall(block.name)) {
-				debug(`askOrchestrator: hiding tool_use ${block.id} from pi (batch path)`);
+			const piName = piToolNameFor(block.name, customToolNameToPi);
+			if (!piName) {
+				debug(`processAssistantMessage: skipping tool_use for unserved tool ${block.name} [${block.id}] — CC rejects it and retries`);
 				continue;
 			}
 			ensureTurnStarted(c);
 			c.turnSawToolCall = true;
 			c.turnToolCallIds.push(block.id);
-			const mappedArgs = mapToolArgs(mapToolName(block.name, customToolNameToPi), block.input);
 			c.turnBlocks.push({
 				type: "toolCall", id: block.id,
-				name: mapToolName(block.name, customToolNameToPi),
-				arguments: mappedArgs,
+				name: piName,
+				arguments: mapToolArgs(piName, block.input),
 			});
 			const idx = c.turnBlocks.length - 1;
 			const toolBlock = c.turnBlocks[idx];
@@ -1071,7 +1345,71 @@ async function consumeQuery(
 	let capturedSessionId: string | undefined;
 
 	for await (const message of sdkQuery) {
+		if (RECORD_STREAM_PATH) appendFileSync(RECORD_STREAM_PATH, `${JSON.stringify(message)}\n`);
 		if (wasAborted()) break;
+		// Everything below the currentPiStream guard is content, which there is
+		// nowhere to put once a turn has ended on a tool call. These three are not
+		// content and must not share that gate:
+		//
+		// - stdin: nothing else closes the CLI's stdin now that the prompt is a
+		//   streamed generator (isSingleUserTurn=false), so missing this hangs the query.
+		// - the failure a `result` carries: it is the only record that the turn
+		//   failed at all. Behind the guard, a 429 arriving at a tool boundary set
+		//   no stopReason, no errorMessage, and logged nothing — the turn simply
+		//   ended empty.
+		// - rate-limit events: notifications to the user, which are most likely to
+		//   fire during exactly the long tool-using turns the guard was skipping.
+		let resultError: string | undefined;
+		if (message.type === "result") {
+			queryCtx.promptStream?.end();
+			logServedContextWindow("result", message, model);
+			resultError = resultErrorText(message);
+			if (resultError !== undefined) {
+				// Consume the rejection alongside the failure it caused, so a later
+				// unrelated failure on this query doesn't inherit the label.
+				if (queryCtx.rateLimitRejection) {
+					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
+					queryCtx.rateLimitRejection = null;
+				}
+				debug(`consumeQuery: error result, subtype=${message.subtype}, error=${resultError}`);
+				if (queryCtx.turnOutput) {
+					queryCtx.turnOutput.stopReason = "error";
+					queryCtx.turnOutput.errorMessage = resultError;
+				}
+			}
+		}
+		if (message.type === "rate_limit_event") {
+			const info = (message as any).rate_limit_info;
+			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+			if (info?.status === "rejected") {
+				// Held so the failure Claude Code sends next can be named as a rate limit.
+				queryCtx.rateLimitRejection = info;
+				// The "rate limited" notice below supersedes warnings; re-arm so the next
+				// window's warnings fire even if it opens straight into allowed_warning.
+				queryCtx.lastRateLimitWarnStep = null;
+				queryCtx.lastRateLimitWarnThreshold = undefined;
+				// resetsAt is Unix seconds, not milliseconds.
+				const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : "unknown";
+				piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
+			} else if (info?.status === "allowed") {
+				// Back under the threshold (window reset) — re-arm the warning dedupe.
+				queryCtx.lastRateLimitWarnStep = null;
+				queryCtx.lastRateLimitWarnThreshold = undefined;
+			} else if (info?.status === "allowed_warning") {
+				// utilization is a fraction (0..1); allowed_warning fires once it crosses surpassedThreshold.
+				const percent = Math.round((info.utilization ?? 0) * 100);
+				// The SDK emits one event per request, so only re-notify when the level
+				// rises past a new 5% step or the threshold changes.
+				const step = Math.floor(percent / 5);
+				const rose = queryCtx.lastRateLimitWarnStep === null || step > queryCtx.lastRateLimitWarnStep;
+				if (rose || info.surpassedThreshold !== queryCtx.lastRateLimitWarnThreshold) {
+					queryCtx.lastRateLimitWarnStep = step;
+					queryCtx.lastRateLimitWarnThreshold = info.surpassedThreshold;
+					piUI?.notify(`Claude rate limit warning: ${percent}% used (${info.rateLimitType ?? ""})`, "warning");
+				}
+			}
+			continue;
+		}
 		if (!queryCtx.currentPiStream || !queryCtx.turnOutput) continue;
 
 		switch (message.type) {
@@ -1081,9 +1419,11 @@ async function consumeQuery(
 			case "assistant":
 				processAssistantMessage(message, model, customToolNameToPi, queryCtx);
 				break;
-			case "result":
-				logServedContextWindow("result", message, model);
-				if (!queryCtx.turnSawStreamEvent && message.subtype === "success") {
+			case "result": {
+					// The failure itself was recorded above the guard, along with the served
+					// context window. What is left here is the success path: push the result
+					// text when no assistant message already delivered it.
+					if (resultError === undefined && !queryCtx.turnSawStreamEvent && message.subtype === "success") {
 					ensureTurnStarted(queryCtx);
 					const text = message.result || "";
 					queryCtx.turnBlocks.push({ type: "text", text });
@@ -1093,27 +1433,20 @@ async function consumeQuery(
 					queryCtx.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: queryCtx.turnOutput });
 				}
 				break;
+			}
 			case "system":
 				if ((message as any).subtype === "init" && (message as any).session_id) {
 					capturedSessionId = (message as any).session_id;
 				}
 				break;
 			case "user":
-				break; // SDK echo of user prompt — not needed
-			case "rate_limit_event": {
-				const info = (message as any).rate_limit_info;
-				debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
-				// resetsAt is unix seconds, not ms; utilization is a 0..1 fraction, not a
-				// percentage. Both need converting - seven_day resets days out, so the
-				// date matters as much as the time.
-				if (info?.status === "rejected") {
-					const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleString() : "unknown";
-					piUI?.notify(`Claude rate limited (${info.rateLimitType ?? "unknown"}) — resets at ${resetsAt}`, "warning");
-				} else if (info?.status === "allowed_warning") {
-					piUI?.notify(`Claude rate limit warning: ${Math.round((info.utilization ?? 0) * 100)}% used (${info.rateLimitType ?? ""})`, "warning");
-				}
+				// SDK echo of the user prompt — no stream events to emit. Note it
+				// carries only prompts and tool results: a steer CC drained at a
+				// tool boundary is recorded in its session transcript as a
+				// `queued_command` attachment and never reaches this stream, which
+				// is why the mid-turn steering tripwire has to live in the
+				// integration test.
 				break;
-			}
 			default:
 				debug("consumeQuery: unhandled SDK message type", message.type);
 				break;
@@ -1126,12 +1459,117 @@ async function consumeQuery(
 	return { capturedSessionId };
 }
 
+/** The trailing user turn as content blocks, or null if there isn't one.
+ *  Blocks rather than text so image steers keep their images. */
+function steerBlocks(messages: Context["messages"]): ContentBlockParam[] | null {
+	const blocks = extractUserPromptBlocks(messages);
+	if (blocks) return blocks;
+	const text = extractUserPrompt(messages);
+	return text ? [{ type: "text", text }] : null;
+}
+
+/** A steer that never made it into CC's session. The cursor has already counted
+ *  it, so count-based sync would skip it forever — rebuild instead, which
+ *  re-imports the message from pi's context. */
+function steerMissedSession(text: string): void {
+	if (!sharedSession) return;
+	sharedSession = { ...sharedSession, needsRebuild: true };
+	debug(`provider: steer never reached CC, marked session for rebuild: ${text.slice(0, 60)}`);
+}
+
+/** Releases this turn's tool results to their MCP handlers, after first pushing
+ *  any steer to CC.
+ *
+ *  The ordering is mandatory, not an optimization. The steer and the MCP tool
+ *  result travel back to CC over the same stdin FIFO. Awaiting the push ack
+ *  (which resolves only once the SDK's write to stdin completed) before
+ *  resolving any handler guarantees CC enqueues the steer *before* it reads the
+ *  tool result, so its post-tool-call drain sees it and acts on it this turn.
+ *  Resolve first and the steer misses the drain, silently degrading to
+ *  follow-up semantics.
+ *
+ *  Both the post-tool-call drain and the FIFO ordering are CC CLI internals,
+ *  not SDK contract — tests/int-tool-message.mjs is the tripwire if they move. */
+async function deliverToolResults(
+	c: QueryContext,
+	results: McpResult[],
+	steer: ContentBlockParam[] | null,
+	contextLength: number,
+): Promise<void> {
+	if (steer) {
+		const text = steer.map((b) => (b.type === "text" ? b.text : "[image]")).join("\n");
+		if (!c.promptStream) {
+			debug(`WARNING: steer with no prompt stream, dropping: ${text.slice(0, 60)}`);
+			steerMissedSession(text);
+		} else {
+			try {
+				await c.promptStream.push(userMessage(steer, "next"));
+				debug(`provider: steer written to CC stdin before tool result: ${text.slice(0, 60)}`);
+			} catch (error) {
+				// The query is ending — pushing further input would wedge tool-result
+				// delivery, so the steer doesn't reach this query. It is still in
+				// pi's context, and the caller has already advanced the session
+				// cursor past it, so force a rebuild or CC would never see it.
+				debug(`provider: steer push rejected, delivering tool result anyway:`, error);
+				steerMissedSession(text);
+			}
+		}
+	}
+
+	debug(`provider: tool results, ${results.length} results, ${c.pendingToolCalls.size} waiting handlers, ctx.msgs=${contextLength}`);
+	for (const result of results) {
+		const id = result.toolCallId;
+		if (id && c.pendingToolCalls.has(id)) {
+			const pending = c.pendingToolCalls.get(id)!;
+			c.pendingToolCalls.delete(id);
+			debug(`provider: resolving ${pending.toolName} [${id}]${result.isError ? " (error)" : ""}`, JSON.stringify(result.content).slice(0, 200));
+			pending.resolve(result);
+		} else if (id) {
+			c.pendingResults.set(id, result);
+			debug(`provider: queued result [${id}] (${c.pendingResults.size} pending)`);
+		} else {
+			debug(`WARNING: tool result without toolCallId, cannot match`);
+		}
+		if (c.pendingToolCalls.size > 0 && c.pendingResults.size > 0) {
+			debug(`BUG: both maps non-empty! handlers=${c.pendingToolCalls.size} results=${c.pendingResults.size}`);
+		}
+	}
+	if (c.pendingToolCalls.size > 0) {
+		debug(`WARNING: ${c.pendingToolCalls.size} MCP handlers still waiting after delivering ${results.length} results`);
+		piUI?.notify(`Claude bridge: ${c.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
+	}
+}
+
+/** Abort teardown for one query: settle everything that would otherwise be left
+ *  awaiting a subprocess we are about to kill. The pump abandons iteration on
+ *  abort, so an in-flight prompt-stream push would hang forever and take
+ *  tool-result delivery with it. */
+function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
+	promptStream.fail(new Error("Operation aborted"));
+	c.releasePendingToolCalls("Operation aborted");
+}
+
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
-function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
-	const stream = newAssistantMessageEventStream();
-	// pi >= 0.86 hands over a TranscriptContext; see transcript-compat.ts
-	const context = toLegacyContext(rawContext) as Context;
+function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+	showStartupNoticeOnce();
+	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
+	// back out to the prompt/tools fields every cursor write, syncSharedSession call and
+	// prompt-capture lookup below assumes (issue #106).
+	context = toBridgeContext(context);
+
+	// One-off summarizer calls arrive HERE too, not only via isolatedStreamFn: /bug report
+	// (summarizeForBugReport) routes through agent.streamFunction -> streamSimple, with no
+	// takeover hook. pi marks every one-off summarizer with cacheRetention:"none" in
+	// completeSummarization, so route on the marker: their prompt is never recorded by the
+	// capture boundaries and resolveOrDerive would throw. Hand them to the isolated path
+	// (separate persistSession:false CC process, no session sync needed).
+	if (options?.cacheRetention === "none") {
+		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
+		return isolatedStreamFn(model, context, options);
+	}
+
+	const stream = createAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
 	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
@@ -1152,46 +1590,19 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
-		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
-		for (const result of allResults) {
-			const id = result.toolCallId;
-			if (id && resultCtx.pendingToolCalls.has(id)) {
-				const pending = resultCtx.pendingToolCalls.get(id)!;
-				resultCtx.pendingToolCalls.delete(id);
-				debug(`provider: resolving ${pending.toolName} [${id}]${result.isError ? " (error)" : ""}`, JSON.stringify(result.content).slice(0, 200));
-				pending.resolve(result);
-			} else if (id) {
-				resultCtx.pendingResults.set(id, result);
-				debug(`provider: queued result [${id}] (${resultCtx.pendingResults.size} pending)`);
-			} else {
-				debug(`WARNING: tool result without toolCallId, cannot match`);
-			}
-			if (resultCtx.pendingToolCalls.size > 0 && resultCtx.pendingResults.size > 0) {
-				debug(`BUG: both maps non-empty! handlers=${resultCtx.pendingToolCalls.size} results=${resultCtx.pendingResults.size}`);
-			}
-		}
-		if (resultCtx.pendingToolCalls.size > 0) {
-			debug(`WARNING: ${resultCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
-			piUI?.notify(`Claude bridge: ${resultCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
-		}
-
-		// Detect user messages (steer/followUp) that pi injected into context
-		// during the active query. This happens when:
-		//   - User sends a steer while a tool is executing; pi drains the steer
-		//     queue at the turn boundary and appends it to context alongside the
-		//     tool result, then calls the provider again.
-		//   - A followUp is delivered between tool-result turns.
-		// The bridge can't forward these mid-query (the SDK query is in progress),
-		// so we save them for replay as continuation queries after consumeQuery ends.
-		if (lastMsgRole === "user") {
-			const userPrompt = extractUserPrompt(context.messages);
-			if (userPrompt) {
-				resultCtx.deferredUserMessages.push(userPrompt);
-				debug(`provider: deferred user message for replay after query: ${userPrompt.slice(0, 60)}`);
-			}
-		}
-
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		// User messages (steer/followUp) pi injected into context during the
+		// active query: a steer sent while a tool was executing, drained by pi at
+		// the turn boundary and appended alongside the tool result.
+		const steer = lastMsgRole === "user" ? steerBlocks(context.messages) : null;
+		// Delivery is async because the steer must reach CC's stdin *before* the
+		// tool result does — see deliverToolResults. Detached so the provider
+		// still returns its stream synchronously.
+		void deliverToolResults(resultCtx, allResults, steer, context.messages.length);
+		// The shared cursor tracks the top-level conversation. A reentrant subagent
+		// delivering its own results would drag it to that subagent's message count
+		// — observed pulling a parent from 5 back to 3, which cost the parent's next
+		// turn a full rebuild and a flushed prompt cache.
+		if (sharedSession && resultCtx === ctx()) sharedSession.cursor = context.messages.length;
 		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
 		return stream;
 	}
@@ -1202,10 +1613,14 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession) sharedSession.cursor = context.messages.length;
-		const c = ctx();  // capture current context for the microtask
+		if (sharedSession && activeQueryContexts.size === 0) sharedSession.cursor = context.messages.length;
+		// No query owns this result, so there is no context to reset: resetTurnState
+		// on the top-level ctx() would replace a live parent's turnOutput mid-stream,
+		// stranding the blocks it had already emitted. A throwaway context just
+		// supplies the empty message this turn ends with.
+		const c = new QueryContext();
+		c.resetTurnState(model);
 		queueMicrotask(() => {
-			c.resetTurnState(model);
 			stream.push({ type: "done", reason: "stop", message: c.turnOutput });
 			markStreamComplete(stream);
 			stream.end();
@@ -1221,18 +1636,41 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	const queryCtx = isReentrant ? new QueryContext() : ctx();
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
+	// Resolved first: an unaccountable system prompt throws, and doing that before
+	// anything is claimed or reset leaves no half-built query behind — in particular
+	// no stream claimed on the shared context that nobody will ever end.
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
+	// Build from what Pi loaded for this run, so `--no-context-files` and
+	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
+	// custom override embeds its parent's assembled Pi prompt; recursive projection
+	// replaces that exact inherited prompt with its already-safe portable parts.
+	// Derive the key from the transcript replay (toBridgeContext), NOT from the
+	// recorded keys: under a forced prompt the transcript head is projected via
+	// transformContext after turn_start, so ctx.getSystemPrompt() is not the head.
+	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
+	const systemPromptAppend = promptCapture
+		? projectPromptCapture(promptCapture, {
+			skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
+		})
+		: undefined;
+
 	// 2. Fresh child context — constructor already gave us clean Maps and empty
 	//    arrays. For a reused top-level context, clear explicitly.
 	claimCurrentPiStream(stream, "fresh-query", queryCtx);
 	queryCtx.pendingToolCalls.clear();
 	queryCtx.pendingResults.clear();
-	queryCtx.deferredUserMessages = [];
+	// Stale ids would let a late result from the previous query route here via
+	// contextForToolResults — which now means pushing its steer into this
+	// query's stdin, not just mismatching a map.
+	queryCtx.turnToolCallIds = [];
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
 
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
-	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
+	const cwd = process.cwd();
+	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
+	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
+	const cliModel = claudeCodeModelId(model, longContextSettings);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -1253,47 +1691,40 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 		promptText = "[continue]";
 	}
 
-	const prompt: string | AsyncIterable<SDKUserMessage> = promptBlocks
-		? wrapPromptStream(promptBlocks)
-		: promptText;
+	// Always stream the prompt rather than passing a string: a parked input
+	// generator is what lets us write steers to CC's stdin mid-turn. The cost is
+	// that `isSingleUserTurn` is false, so the SDK no longer closes stdin on the
+	// first result — consumeQuery ends the stream explicitly instead, or the
+	// query would never terminate.
+	const promptStream = makePromptStream();
+	void promptStream.push(userMessage(promptBlocks ?? [{ type: "text", text: promptText }]))
+		.catch((error) => debug(`provider: initial prompt push rejected:`, error));
+	queryCtx.promptStream = promptStream;
 	const mcpServers = buildMcpServers(mcpTools, queryCtx, promptText);
-	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
-	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
-	const appendParts = [agentsAppend, skillsAppend].filter((part): part is string => Boolean(part));
-	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-	const usePresetPrompt = providerSettings.systemPromptPreset !== false;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
 	// + per-project) and .mcp.json. Since pi executes tools (not CC), those are pure
 	// token overhead. --strict-mcp-config tells the binary to use ONLY mcpServers passed
 	// programmatically and ignore filesystem MCP entries — applied unconditionally because
-	// settingSources=undefined does NOT give isolation (the CC default loads all sources).
-	// An explicit setting now wins in both modes. It could previously only be
-	// reached with appendSystemPrompt off, which left the default path unable to
-	// opt out of CC's filesystem sources — and those are not free: with
-	// `undefined` CC loads every source, so a project `CLAUDE.md` containing
-	// `@AGENTS.md` re-imports a file the append already carries. Measured
-	// 2026-08-31 in vitu-portal/site/Scripts: ~15k tokens per request from
-	// project skills, plugin skills and those imports, of which ~4.4k was the
-	// duplicated AGENTS.md. `settingSources: []` isolates it; pi's own skills
-	// are unaffected because they travel in the append.
-	const settingSources: SettingSource[] | undefined =
-		providerSettings.settingSources ?? (appendSystemPrompt ? undefined : ["user", "project"]);
+	// settingSources is left at CC's default, which loads all sources.
 	const strictMcpConfigEnabled = providerSettings.strictMcpConfig !== false;
 	const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
 
-	// Prefer the model's own thinkingLevelMap when present (pi-ai 0.72+ ships
-	// per-model overrides — e.g. opus-4-7 wants xhigh→xhigh, not xhigh→max).
-	// Fall back to our generic table for older pi-ai or unmapped levels.
+	// Prefer the model's own thinkingLevelMap (per-model overrides — e.g. a map can
+	// route xhigh→xhigh where the generic table maps xhigh→max). pi-ai's catalog
+	// ships a map for most Claude models; the table below covers models without
+	// one, and the levels a map leaves unnamed. A null entry means the level is
+	// unsupported on that model: no effort argument is sent, so Claude Code's own
+	// default applies rather than the generic table's value. Map values are
+	// provider-generic strings, so a map value is trusted only when it names a
+	// level CC accepts.
+	const mapped = options?.reasoning ? model.thinkingLevelMap?.[options.reasoning] : undefined;
 	const effort = options?.reasoning
-		? ((model as any).thinkingLevelMap?.[options.reasoning] as EffortLevel | undefined)
-			?? REASONING_TO_EFFORT[options.reasoning]
+		? mapped === undefined
+			? REASONING_TO_EFFORT[options.reasoning]
+			: VALID_EFFORTS.has(mapped as EffortLevel) ? mapped as EffortLevel : undefined
 		: undefined;
 
-	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
-	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
-	const cliModel = claudeCodeModelId(model, longContextSettings);
 	const extraArgs: Record<string, string | null> = { model: cliModel };
 	if (strictMcpConfigEnabled) extraArgs["strict-mcp-config"] = null;
 	// Opus 4.7 defaults thinking.display to "omitted" (empty thinking text in stream).
@@ -1310,27 +1741,36 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	// DISABLE_OMC=1: pi sessions have their own rule infrastructure (skills with
-	// triggers, composite AGENTS.md). The oh-my-claudecode plugin's Stop/UserPromptSubmit
-	// hooks (workflow-drift-guard nudging AskUserQuestion — a tool pi doesn't surface —
-	// skill-injector, rules-injector) duplicate that and are interactive-CC-specific noise
-	// here. OMC stays active for native Claude Code.
-	const childEnv = { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1", DISABLE_OMC: "1" };
+	const childEnv = { ...process.env, ...CC_CHILD_ENV };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
 		tools: [],
 		permissionMode: "bypassPermissions",
 		includePartialMessages: true,
-		systemPrompt: usePresetPrompt
-			? {
-				type: "preset", preset: "claude_code",
-				append: systemPromptAppend ? systemPromptAppend : undefined,
-			}
-			: [MINIMAL_SYSTEM_PROMPT, systemPromptAppend].filter(Boolean).join("\n\n"),
+		// includeGitInstructions:false drops the gitStatus block from the preset.
+		// That block is the trailing suffix of the cached system block, and a
+		// git-state transition (new file, staging, commit) rewrites it — busting
+		// the prompt cache for the whole conversation from there on (see
+		// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
+		// hit on every transition. Cost here is nil: the setting also strips
+		// CC's git-workflow guidance from its Bash tool prompt, but the provider
+		// path runs CC with `tools: []`, so those definitions never ship.
+		// AskClaude keeps CC's native tools and its guidance — unaffected.
+		settings: {
+			...claudeCodeSettings(providerSettings),
+			claudeMdExcludes: CLAUDE_MD_EXCLUDES,
+			includeGitInstructions: false,
+		},
+		systemPrompt: {
+			type: "preset", preset: "claude_code",
+			append: systemPromptAppend ? systemPromptAppend : undefined,
+		},
 		extraArgs,
 		...(effort ? { effort } : {}),
-		...(settingSources ? { settingSources } : {}),
+		// An explicit provider.settingSources wins over CC's default of every source
+		// (see Config); [] keeps the user's and the project's skills out of the prompt.
+		...(providerSettings.settingSources ? { settingSources: providerSettings.settingSources } : {}),
 		...(mcpServers ? { mcpServers } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
@@ -1340,12 +1780,12 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	debug("provider: fresh query",
 		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
-		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
+		`ctxFiles=${promptCapture?.contextFiles.length ?? 0} strictMcp=${strictMcpConfigEnabled}`,
 		`prompt=${promptText.slice(0, 60)}${promptBlocks ? " [+images]" : ""}`);
 
 	// 3. Start SDK query and claim it for this context
 	let wasAborted = false;
-	const sdkQuery = query({ prompt, options: queryOptions });
+	const sdkQuery = query({ prompt: promptStream.stream, options: queryOptions });
 	queryCtx.activeQuery = sdkQuery;
 	activeQueryContexts.add(queryCtx);
 
@@ -1360,11 +1800,7 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 	};
 	const onAbort = () => {
 		wasAborted = true;
-		// Prevent stale deferred messages from being replayed by parent on pop
-		abortCtx.deferredUserMessages = [];
-		for (const pending of abortCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Operation aborted" }] }); }
-		abortCtx.pendingToolCalls.clear();
-		abortCtx.pendingResults.clear();
+		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
 	if (options?.signal) {
@@ -1380,7 +1816,6 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 			// --- Abort detection in normal completion path ---
 			if (wasAborted || options?.signal?.aborted) {
 				if (sharedSession) sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
-				queryCtx.deferredUserMessages = [];
 				debug(`provider: abort detected, marked sharedSession needsRebuild + forceRotate`);
 				if (queryCtx.turnOutput) {
 					queryCtx.turnOutput.stopReason = "aborted";
@@ -1408,42 +1843,6 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 				sharedSession = { sessionId, cursor, cwd };
 			}
 
-			// --- Replay deferred user messages as continuation queries ---
-			try {
-				while (queryCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
-					const steerPrompt = queryCtx.deferredUserMessages.shift()!;
-					debug(`provider: replaying deferred user message: ${steerPrompt.slice(0, 60)}`);
-					queryCtx.resetTurnState(model);
-
-					const resumeId = sharedSession?.sessionId;
-					if (!resumeId) {
-						debug(`WARNING: no session to resume for deferred message, dropping`);
-						break;
-					}
-
-					const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
-					const contQuery = query({ prompt: steerPrompt, options: contOptions });
-					queryCtx.activeQuery = contQuery;
-
-					debug(`provider: continuation query, model=${cliModel}, resume=${resumeId.slice(0, 8)}, prompt=${steerPrompt.slice(0, 60)}`);
-
-					try {
-						const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
-						const sid = contSid ?? sharedSession?.sessionId;
-						if (sid) {
-							sharedSession = { sessionId: sid, cursor: sharedSession?.cursor ?? 0, cwd };
-						}
-					} catch (contError) {
-						debug(`provider: continuation query error:`, contError);
-						break;
-					} finally {
-						contQuery.close();
-					}
-				}
-			} finally {
-				queryCtx.activeQuery = sdkQuery;
-			}
-
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				debug("provider: clearing activeQuery before final stream completion");
 				queryCtx.activeQuery = null;
@@ -1457,15 +1856,15 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 			} else {
 				sharedSession = null;
 			}
-			queryCtx.deferredUserMessages = [];
+			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {
 				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
-				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
+				// The SDK drops its copy of the result text if any message follows the error
+				// result, so prefer the cause consumeQuery recorded off the result itself.
+				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
 			}
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
-				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
-				queryCtx.pendingToolCalls.clear();
-				queryCtx.pendingResults.clear();
+				queryCtx.releasePendingToolCalls("Query ended");
 				debug("provider: clearing activeQuery before error stream completion");
 				queryCtx.activeQuery = null;
 			}
@@ -1477,14 +1876,22 @@ function streamClaudeAgentSdk(model: Model<any>, rawContext: Context, options?: 
 		})
 		.finally(() => {
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
-			if (queryCtx.activeQuery === sdkQuery) {
-				// Drain pending handlers for this query
-				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
-				queryCtx.pendingToolCalls.clear();
-				queryCtx.pendingResults.clear();
+			// Settle any ack still parked in the generator — the CLI is gone, so
+			// nothing will resume it. Clear the handle only if a later query
+			// hasn't already claimed the shared context.
+			promptStream.fail(new Error("query ended"));
+			if (queryCtx.promptStream === promptStream) queryCtx.promptStream = null;
+			// A later query claiming this context sets activeQuery to its own handle;
+			// null means the .then/.catch above cleared ours and nothing replaced it.
+			// Testing only for `=== sdkQuery` would never fire on the non-reentrant
+			// path, leaving the top-level context in the routing set forever — where a
+			// later orphaned tool result matches its stale turnToolCallIds and takes
+			// the delivery branch, returning a stream nothing ends.
+			if (queryCtx.activeQuery === sdkQuery || queryCtx.activeQuery === null) {
+				queryCtx.releasePendingToolCalls("Query ended");
 				queryCtx.activeQuery = null;
+				activeQueryContexts.delete(queryCtx);
 			}
-			activeQueryContexts.delete(queryCtx);
 			sdkQuery.close();
 		});
 
@@ -1527,17 +1934,28 @@ async function promptAndWait(
 		} else {
 			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
-			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, modelId);
+			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel);
 			resumeSessionId = sync.sessionId;
 		}
 	}
 
 	// Mode → disallowed tools
-	const disallowedTools = MODE_DISALLOWED_TOOLS[mode] ?? [];
+	const disallowedTools = MODE_DISALLOWED_TOOLS[mode];
 
-	// Skills append
-	const skillsBlock = options?.appendSkills !== false && options?.systemPrompt
-		? extractSkillsBlock(options.systemPrompt) : undefined;
+	// AskClaude uses Claude Code's native Read tool rather than Pi's MCP bridge.
+	// Same resolver as the provider path: a prompt neither recorded nor derivable
+	// throws here too, rather than silently sending Claude Code no skills.
+	//
+	// Resolved only when the answer would be used. The throw is justified by what a
+	// miss would cost, so where it costs nothing — skills switched off, or no reader
+	// to open a skill file with — an unrelated miss must not fail the call.
+	const skillReadTool = disallowedTools.includes("Read") ? "none" : "native";
+	const skillCapture = options?.appendSkills !== false && skillReadTool !== "none"
+		? promptCaptures.resolveOrDerive(options?.systemPrompt)
+		: undefined;
+	const skillsBlock = skillCapture
+		? renderSkillsBlock(collectPromptSkills(skillCapture), skillReadTool)
+		: undefined;
 
 	// Effort
 	const effort = options?.thinking && options.thinking !== "off"
@@ -1556,17 +1974,25 @@ async function promptAndWait(
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
 		`skills=${Boolean(skillsBlock)} promptLen=${prompt.length}`);
 
+	// skills: [] suppresses Claude Code's own skill listing, a system-reminder naming every
+	// skill under the ~/.claude estate. The provider path gets this for free — `tools: []`
+	// removes the Skill tool and the listing with it — but AskClaude runs on CC's native
+	// tools, so it has to be asked for. Pi-side skills still arrive via skillsBlock below,
+	// which is meant to be the only channel.
 	const sdkQuery = query({
 		prompt,
 		options: {
 			cwd,
-			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
+			env: { ...process.env, ...CC_CHILD_ENV },
 			permissionMode: "bypassPermissions",
+			settings: { ...claudeCodeSettings(providerSettings), claudeMdExcludes: CLAUDE_MD_EXCLUDES },
+			skills: [],
 			...(disallowedTools.length ? { disallowedTools } : {}),
 			...(effort ? { effort } : {}),
-			systemPrompt: skillsBlock
-				? { type: "preset", preset: "claude_code", append: skillsBlock }
-				: undefined,
+			// Preset unconditionally: omitting it leaves the child on the SDK's bare default,
+			// without the tool and permission guidance the bridge relies on everywhere else.
+			// Whether pi has skills to append is unrelated to whether the child needs that.
+			systemPrompt: { type: "preset", preset: "claude_code", append: skillsBlock },
 			settingSources: ["user", "project"] as SettingSource[],
 			extraArgs,
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
@@ -1633,6 +2059,12 @@ async function promptAndWait(
 					if (r.usage) {
 						debug(`askClaude: result usage: in=${r.usage.input_tokens} out=${r.usage.output_tokens} cacheRead=${r.usage.cache_read_input_tokens ?? 0} cacheWrite=${r.usage.cache_creation_input_tokens ?? 0} turns=${r.num_turns ?? "?"}`);
 					}
+					// Claude Code reports an API failure with `is_error` on a result whose
+					// subtype is still "success", so without this the error text was returned
+					// as Claude's answer and pi's model read a 429 as content. Throwing hands
+					// it to the tool's own catch, which renders it as an error result.
+					const failure = wasAborted ? undefined : resultErrorText(message);
+					if (failure) throw new Error(failure);
 					if (!responseText && message.subtype === "success" && message.result) {
 						responseText = message.result;
 					}
@@ -1655,9 +2087,6 @@ async function promptAndWait(
 
 // --- Extension registration ---
 
-const DEFAULT_TOOL_DESCRIPTION_FULL = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories), or to autonomously handle a task. Defaults to read-only mode — use full mode when the user wants to delegate a task that requires changes. Prefer to handle straightforward tasks yourself.";
-const DEFAULT_TOOL_DESCRIPTION = "Delegate to Claude Code for a second opinion or analysis (code review, architecture questions, debugging theories). Read-only — Claude Code can explore the codebase but not make changes. Prefer to handle straightforward tasks yourself.";
-
 const PREVIEW_MAX_CHARS = 1000;
 const PREVIEW_MAX_LINES = 6;
 
@@ -1672,11 +2101,25 @@ export default function (pi: ExtensionAPI) {
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
+	// Validate at the boundary: a non-array here would throw inside every
+	// claudeCodeModelId call and brick the extension at activation.
+	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
+		? providerSettings.forceTwoHundredK.filter((id): id is string => typeof id === "string")
+		: undefined;
 	longContextSettings = {
 		plan: providerSettings.plan ?? "pro",
 		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
+		forceTwoHundredK,
 	};
 	const registeredModels = applyLongContext(MODELS, longContextSettings);
+	if (registeredModels.length === 0) {
+		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.86.1)");
+	}
+
+	if (!config.startupNoticeShown) {
+		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
+		if (config.askClaude?.enabled === undefined) pendingNotices.push("The AskClaude tool is opt-in only. Set askClaude.enabled to use it.");
+	}
 
 	// Reset shared session on pi session lifecycle events
 	const clearSession = (event: string) => {
@@ -1694,11 +2137,70 @@ export default function (pi: ExtensionAPI) {
 	};
 	pi.on("session_start", (event, ctx) => {
 		piUI = ctx.ui;
+		piMode = ctx.mode;
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "fork") {
 			clearSession(`session_start:${event.reason}`);
 		}
 	});
-	pi.on("session_shutdown", () => clearSession("session_shutdown"));
+	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
+	// Code's preset carries its own tool and permission guidance that the bridge
+	// still depends on, so both flags are forwarded as an append.
+	//
+	// The options (custom/append/contextFiles/skills) are pi config, stable across a
+	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
+	// at before_agent_start so the agent_start recording below can reuse them.
+	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
+	let lastSystemPromptOptions: RecordOptions | undefined;
+	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
+		customPrompt?: string;
+		appendSystemPrompt?: string;
+		contextFiles?: { path: string; content: string }[];
+		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
+		selectedTools?: string[];
+	} | undefined) {
+		if (!systemPrompt) return;
+		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
+		promptCaptures.record(systemPrompt, {
+			custom: options?.customPrompt,
+			append: options?.appendSystemPrompt,
+			contextFiles: options?.contextFiles ?? [],
+			skills: hasRead ? options?.skills ?? [] : [],
+		}, source);
+	}
+	pi.on("before_agent_start", (event) => {
+		lastSystemPromptOptions = event.systemPromptOptions;
+		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
+	});
+	// The prompt the provider actually queries with is the fully-widened one: MCP tool
+	// descriptions merge into the system prompt only after their servers connect, which
+	// is after before_agent_start. ctx.getSystemPrompt() returns that widened prompt by
+	// agent_start (verified: before_agent_start=10,988 chars vs agent_start/query=23,479).
+	// A subagent embeds the widened parent prompt verbatim (pi-subagents reads
+	// ctx.getSystemPrompt() at dispatch), so unless the widened prompt is a capture key
+	// too, the child's turn resolves against nothing, falls to a verbatim side request,
+	// and ships pi's harness — tripping the server's third-party plan-eligibility check
+	// ("out of extra usage"). Recording it here, before the query, restores the match.
+	//
+	// agent_start also captures a handler-returned forceSystemPrompt, which
+	// buildSystemPrompt renders verbatim.
+	pi.on("agent_start", (_event, ctx) => {
+		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+
+	// Mid-run re-renders: turn_start fires before every turn (first turn included)
+	// after the turn's prompt is final: prepareNextTurnWithContext has
+	// re-rendered the options (pi's section-based prompt) and any mid-run
+	// setActiveToolsByName rebuild has already landed. Re-keying at each boundary
+	// the prompt can change at keeps exact-match alive mid-run. The stashed options can
+	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
+	// next before_agent_start — accepted: a stale skills list beats failing the turn.
+	pi.on("turn_start", (_event, ctx) => {
+		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+	pi.on("session_shutdown", () => {
+		reportLeaks("session_shutdown");
+		clearSession("session_shutdown");
+	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
@@ -1749,66 +2251,107 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_compact", (event) => markRebuild(`session_compact:${event.reason}:willRetry=${event.willRetry}`));
 	pi.on("session_tree", () => markRebuild("session_tree"));
 
+	// Branch summarization — rewind or fork-at-point with "summarize" — is the other
+	// place pi asks the model for a summary, and unlike compaction it runs through
+	// the *agent's* stream function (agent-session passes `streamFn:
+	// this.agent.streamFunction`). On a bridge model that reaches this provider
+	// carrying pi's internal summarization prompt, which no `before_agent_start`
+	// ever recorded, so the prompt-capture resolver has nothing to resolve it to.
+	// Take it over the way compaction is taken over: the summary runs as its own
+	// Claude Code subprocess, never touching the live session or the resolver.
+	pi.on("session_before_tree", async (event, ctx) => {
+		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		const { entriesToSummarize, userWantsSummary, customInstructions, replaceInstructions } = event.preparation;
+		if (!userWantsSummary || entriesToSummarize.length === 0) return undefined;
+		debug(`session_before_tree: takeover entries=${entriesToSummarize.length} target=${event.preparation.targetId.slice(0, 8)}`);
+		try {
+			const result = await generateBranchSummary(entriesToSummarize, {
+				model: ctx.model,
+				signal: event.signal,
+				customInstructions,
+				replaceInstructions,
+				streamFn: isolatedStreamFn,
+			});
+			return branchSummaryOutcome(result);
+		} catch (err) {
+			debug("session_before_tree: takeover failed; cancelling navigation", err);
+			ctx.ui?.notify?.(
+				`Claude bridge branch summary failed (${errorMessage(err)}); navigation cancelled.`,
+				"error",
+			);
+			return { cancel: true };
+		}
+	});
+
 	// --- Provider ---
 	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
-	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
+	// Registration policy across module instances (a subagent session can load
+	// this module fresh): the FIRST instance registers unconditionally at load,
+	// which is what puts claude-bridge models in the picker before any session
+	// starts. Later instances decide at session_start, when ctx.modelRegistry
+	// reveals who owns this session's registry:
+	//
+	// - Registry already has the provider (host passes the parent's registry down,
+	//   e.g. pi-subagents >=0.14.3): skip. Re-registering would overwrite the
+	//   parent's pinned streamSimple with this instance's fresh — empty-state —
+	//   stream fn, and the parent's next tool-result delivery would route into it.
+	// - Registry lacks the provider (host gives the child its own, e.g. older
+	//   pi-subagents forks): register, or every claude-bridge/* dispatch in the
+	//   child fails with "Model not found" (#91). Even loading the bridge via the
+	//   agent's `extensions:` frontmatter didn't help there — the module loaded,
+	//   hit the old skip-guard, and the child's registry stayed empty.
+	//
+	// A per-instance stream fn registered into a per-instance registry is
+	// self-consistent: that session's traffic flows through this module state,
+	// which starts clean and serves only that session.
+	//
+	// On session_shutdown (including /reload), clearSession() resets
+	// ACTIVE_STREAM_SIMPLE_KEY so a freshly loaded module can register as first
+	// again.
 
 	const g = globalThis as Record<symbol, any>;
+	const providerConfig = {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		// Cast: the Provider interface passes a TranscriptContext; the bridge takes plain
+		// Context models (toBridgeContext normalizes at the stream entry points).
+		streamSimple: streamClaudeAgentSdk as any,
+	};
 	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
 		// First instance: store our streamSimple and register.
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, {
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: registeredModels,
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: streamClaudeAgentSdk as any,
-		});
+		pi.registerProvider(PROVIDER_ID, providerConfig);
 	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
+		// Later instance: register only if this session's registry lacks the provider.
+		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
+		pi.on("session_start", (_event, ctx) => {
+			if (ctx.modelRegistry.getProvider(PROVIDER_ID)) {
+				debug(`provider: registry already has ${PROVIDER_ID}, skipping registration (module=${moduleInstanceId})`);
+				return;
+			}
+			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
+			pi.registerProvider(PROVIDER_ID, providerConfig);
+		});
 	}
 
 	// --- AskClaude tool ---
 
 	const askConf = config.askClaude;
-	const allowFull = askConf?.allowFullMode !== false;
-	const defaultMode = askConf?.defaultMode ?? "read";
-	const defaultIsolated = askConf?.defaultIsolated ?? false;
+	const askDefaults = resolveAskClaudeDefaults(askConf);
 	askClaudeToolName = askConf?.name ?? "AskClaude";
 
-	const modeValues = allowFull ? ["read", "full", "none"] as const : ["read", "none"] as const;
-	let modeDesc = `"read" (default): questions about the codebase — review, analysis, explain. "none": general knowledge only (no file access).`;
-	if (allowFull) modeDesc += ` "full": allows writing and bash execution (careful: runs without feedback to pi).`;
-
-	if (askConf?.enabled !== false) {
-		const askClaudeParams = Type.Object({
-			prompt: Type.String({ description: "The question or task for Claude Code. By default Claude sees the full conversation history. Don't research up front, let Claude explore." }),
-			mode: Type.Optional(StringEnum(modeValues, { description: modeDesc })),
-			model: Type.Optional(Type.String({ description: 'Claude model (e.g. "opus", "sonnet", "haiku", or full ID). Defaults to "opus".' })),
-			thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "Thinking effort level. Omit to use Claude Code's default." })),
-			isolated: Type.Optional(Type.Boolean({ description: "When true, Claude sees only this prompt (clean session). When false (default), Claude sees the full conversation history." })),
-		});
+	if (askConf?.enabled) {
+		const askClaudeParams = buildAskClaudeParams(askDefaults);
 		pi.registerTool<typeof askClaudeParams>({
 			name: askConf?.name ?? "AskClaude",
 			label: askConf?.label ?? "Ask Claude Code",
-			description: askConf?.description ?? (allowFull ? DEFAULT_TOOL_DESCRIPTION_FULL : DEFAULT_TOOL_DESCRIPTION),
+			description: askClaudeToolDescription(askDefaults, askConf?.description),
 			parameters: askClaudeParams,
 			renderCall(args, theme) {
 				let text = theme.fg("mdLink", theme.bold("AskClaude "));
-				const mode = args.mode ?? defaultMode;
-				const tags: string[] = [];
-				if (mode !== defaultMode) tags.push(`mode=${mode}`);
-				if (args.model) tags.push(`model=${args.model}`);
-				if (args.thinking) tags.push(`thinking=${args.thinking}`);
-				if (args.isolated) tags.push("isolated");
+				const tags = askClaudeCallTags(args, askDefaults);
 				if (tags.length) text += `${theme.fg("accent", `[${tags.join(", ")}]`)} `;
 				const truncated = args.prompt.length > PREVIEW_MAX_CHARS ? args.prompt.substring(0, PREVIEW_MAX_CHARS) : args.prompt;
 				const lines = truncated.split("\n").slice(0, PREVIEW_MAX_LINES);
@@ -1856,8 +2399,8 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				const mode = (params.mode ?? defaultMode) as "full" | "read" | "none";
-				const isolated = params.isolated ?? defaultIsolated;
+				const mode = resolveAskClaudeMode(params.mode, askDefaults);
+				const isolated = params.isolated ?? askDefaults.isolated;
 				const toolCalls = new Map<string, ToolCallState>();
 				const start = Date.now();
 
@@ -1878,7 +2421,7 @@ export default function (pi: ExtensionAPI) {
 						model: params.model,
 						thinking: params.thinking,
 						isolated,
-						context: isolated ? undefined : withoutSystemMessages(buildSessionContext(ctx.sessionManager.getBranch()).messages) as Context["messages"],
+						context: isolated ? undefined : buildSessionContext(ctx.sessionManager.getBranch()).messages as Context["messages"],
 					});
 					clearInterval(progressInterval);
 					onUpdate?.({ content: [{ type: "text", text: "" }], details: {} });

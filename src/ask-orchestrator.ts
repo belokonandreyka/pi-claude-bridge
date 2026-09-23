@@ -16,7 +16,7 @@
 // to execute a tool it does not have and every later tool call would be handed
 // the wrong toolCallId.
 
-import { piAgentDir } from "./config.js";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { completeSimple, getModels } from "@earendil-works/pi-ai/compat";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
@@ -105,7 +105,7 @@ export function filterFallbackChain(
 
 
 function loadFallbackChain(allowPaid: boolean, debug: (...args: unknown[]) => void): { provider: string; id: string }[] {
-	const path = join(piAgentDir(), "model-fallback.json");
+	const path = join(getAgentDir(), "model-fallback.json");
 	if (!existsSync(path)) return [];
 	try {
 		return filterFallbackChain(JSON.parse(readFileSync(path, "utf-8")), allowPaid);
