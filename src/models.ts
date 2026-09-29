@@ -29,8 +29,29 @@ function versionRank(id: string): { family: string; tuple: [number, number] } {
 	return { family, tuple: [Number(major) || 0, Number(minor) || 0] };
 }
 
-export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
-	return piAiModels
+// Ids Claude Code already serves that pi-ai's catalog does not list yet. Each
+// is cloned from a sibling entry (same family, previous generation) so it shows
+// up in the picker before pi-ai ships it; once pi-ai lists the id, the catalog
+// entry wins and the supplement is a no-op. Drop a row when pi-ai catches up.
+const CATALOG_SUPPLEMENTS: Array<{ id: string; name: string; from: string }> = [
+	// Served by Claude Code 2.1.282 (modelUsage reports the id); absent from pi-ai 0.87.1.
+	{ id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5", from: "claude-sonnet-5" },
+];
+
+export function supplementCatalog<T extends { id: string; name: string }>(piAiModels: T[]): T[] {
+	const present = new Set(piAiModels.map((m) => m.id));
+	const added: T[] = [];
+	for (const { id, name, from } of CATALOG_SUPPLEMENTS) {
+		if (present.has(id)) continue;
+		const base = piAiModels.find((m) => m.id === from);
+		if (!base) continue;
+		added.push({ ...base, id, name });
+	}
+	return added.length === 0 ? piAiModels : [...piAiModels, ...added];
+}
+
+export function buildModels<T extends { id: string; name: string; [key: string]: any }>(piAiModels: T[]) {
+	return supplementCatalog(piAiModels)
 		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
 		.sort((a, b) => {
 			const fa = FAMILY_ORDER.indexOf(versionRank(a.id).family);
@@ -86,6 +107,9 @@ const MEASURED_ONE_M = new Set([
 	"claude-opus-4-8",
 	"claude-opus-4-7",
 	"claude-sonnet-5",
+	// Measured 2026-09-29 through Claude Code 2.1.282 on Max: bare id serves 200K,
+	// `[1m]` serves 1M (modelUsage.contextWindow). Not yet measured on Pro.
+	"claude-sonnet-5-5",
 ]);
 
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when

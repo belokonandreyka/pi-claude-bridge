@@ -51,7 +51,8 @@ describe("MODELS projection", () => {
 			oneM("claude-opus-4-7"), oneM("claude-opus-5"),
 			oneM("claude-sonnet-5"), oneM("claude-opus-4-6"),
 		]);
-		assert.deepEqual(models.map((m) => m.id), ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5"]);
+		// claude-sonnet-5-5 is the catalog supplement cloned from claude-sonnet-5 (see below).
+		assert.deepEqual(models.map((m) => m.id), ["claude-opus-5", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5"]);
 	});
 
 	it("keeps dated aliases from stealing shortcuts from bare ids", () => {
@@ -74,6 +75,27 @@ describe("MODELS projection", () => {
 	it("forwards undefined thinkingLevelMap unchanged (no fabricated defaults)", () => {
 		const models = buildModels([mockPiAiModel("claude-haiku-4-5")]);
 		assert.equal(find(models, "claude-haiku-4-5")?.thinkingLevelMap, undefined);
+	});
+
+	it("supplements the catalog with claude-sonnet-5-5 cloned from claude-sonnet-5", () => {
+		const models = buildModels([mockPiAiModel("claude-sonnet-5", { contextWindow: 1000000, thinkingLevelMap: { xhigh: "xhigh" }, maxTokens: 128000 })]);
+		assert.deepEqual(models.map((m) => m.id), ["claude-sonnet-5-5", "claude-sonnet-5"]);
+		const s55 = find(models, "claude-sonnet-5-5");
+		assert.equal(s55.name, "Claude Sonnet 5.5");
+		assert.equal(s55.maxTokens, 128000);
+		assert.deepEqual(s55.thinkingLevelMap, { xhigh: "xhigh" });
+		assert.equal(resolveModel(models, "sonnet")?.id, "claude-sonnet-5-5");
+	});
+
+	it("leaves the supplement out once pi-ai lists the id itself", () => {
+		const models = buildModels([oneM("claude-sonnet-5"), mockPiAiModel("claude-sonnet-5-5", { name: "From pi-ai" })]);
+		assert.equal(models.filter((m) => m.id === "claude-sonnet-5-5").length, 1);
+		assert.equal(find(models, "claude-sonnet-5-5").name, "From pi-ai");
+	});
+
+	it("skips a supplement whose base entry is missing", () => {
+		const models = buildModels([oneM("claude-opus-5")]);
+		assert.equal(find(models, "claude-sonnet-5-5"), undefined);
 	});
 });
 
@@ -192,4 +214,8 @@ describe("applyLongContext", () => {
 
 it("claude-opus-5-5 requests 1M on Pro", () => {
 	assert.deepEqual(resolveClaudeCodeRuntimeModel({ id: "claude-opus-5-5" }, PRO), { cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000 });
+});
+
+it("claude-sonnet-5-5 requests 1M on Pro", () => {
+	assert.deepEqual(resolveClaudeCodeRuntimeModel({ id: "claude-sonnet-5-5" }, PRO), { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: 1000000 });
 });
