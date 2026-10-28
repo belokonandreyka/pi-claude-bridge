@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 const { __test } = await import("../src/index.js");
+const { claudeCodeChildEnv } = await import("../src/child-env.js");
 
 describe("Claude Code child environment", () => {
 	it("disables auto-compaction, claude.ai MCP servers and oh-my-claudecode hooks", () => {
@@ -18,9 +19,28 @@ describe("Claude Code child environment", () => {
 		});
 	});
 
-	// Deliberately not asserted here: that every `query()` call site spreads the
-	// constant. The only way to check that from a unit test is to grep src/index.ts,
-	// which fails on innocent indirection (`env: childEnv`) and would have to be
-	// taught about it — a brittle test that reads as coverage. The three sites
-	// referencing CC_CHILD_ENV are the guard, and a fourth is a review question.
+	// Deliberately not asserted here: that every `query()` call site builds its env
+	// with claudeCodeChildEnv(). The only way to check that from a unit test is to
+	// grep src/index.ts, which fails on innocent indirection (`env: childEnv`) and
+	// would have to be taught about it — a brittle test that reads as coverage. The
+	// three call sites are the guard, and a fourth is a review question.
+
+	it("drops ANTHROPIC_API_KEY so the bridge uses the subscription login", () => {
+		const env = claudeCodeChildEnv({ ANTHROPIC_API_KEY: "sk-test", CLAUDE_CONFIG_DIR: "/c", PATH: "/bin" });
+		assert.equal(env.ANTHROPIC_API_KEY, undefined);
+		assert.equal(env.CLAUDE_CONFIG_DIR, "/c");
+		assert.equal(env.DISABLE_AUTO_COMPACT, "1");
+	});
+
+	it("keeps the key only when CLAUDE_BRIDGE_KEEP_API_KEY=1, and never forwards the switch", () => {
+		const env = claudeCodeChildEnv({ ANTHROPIC_API_KEY: "sk-test", CLAUDE_BRIDGE_KEEP_API_KEY: "1" });
+		assert.equal(env.ANTHROPIC_API_KEY, "sk-test");
+		assert.equal(env.CLAUDE_BRIDGE_KEEP_API_KEY, undefined);
+	});
+
+	it("does not touch the parent environment", () => {
+		const parent = { ANTHROPIC_API_KEY: "sk-test" };
+		claudeCodeChildEnv(parent);
+		assert.equal(parent.ANTHROPIC_API_KEY, "sk-test");
+	});
 });
