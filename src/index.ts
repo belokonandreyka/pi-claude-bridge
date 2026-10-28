@@ -9,6 +9,7 @@ import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { CC_CHILD_ENV, claudeCodeChildEnv } from "./child-env.js";
+import { spawnInOwnProcessGroup } from "./spawn.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
@@ -106,6 +107,13 @@ function makeCliDebugOptions(tag: string): { debug?: boolean; debugFile?: string
 			}
 		},
 	};
+}
+
+// Debug capture plus the spawner that keeps Claude Code out of the terminal's
+// foreground process group (see spawn.ts). Spread into every query's options.
+function cliProcessOptions(tag: string) {
+	const cliDebug = makeCliDebugOptions(tag);
+	return { ...cliDebug, spawnClaudeCodeProcess: spawnInOwnProcessGroup(cliDebug.stderr) };
 }
 
 /** Unconditional diagnostic dump — for "should never happen" paths */
@@ -479,7 +487,7 @@ async function runIsolatedSummary(
 				model: cliModel,
 				maxTurns: 1,
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
+				...cliProcessOptions("compact-summary"),
 			},
 		});
 
@@ -1757,7 +1765,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		...(mcpServers ? { mcpServers } : {}),
 		...(resumeSessionId ? { resume: resumeSessionId } : {}),
 		...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-		...makeCliDebugOptions("provider"),
+		...cliProcessOptions("provider"),
 	};
 
 	debug("provider: fresh query",
@@ -1981,7 +1989,7 @@ async function promptAndWait(
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
 			...(options?.isolated ? { persistSession: false } : {}),
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-			...makeCliDebugOptions("askclaude"),
+			...cliProcessOptions("askclaude"),
 		},
 	});
 
