@@ -9,6 +9,7 @@ import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { CC_CHILD_ENV, claudeCodeChildEnv } from "./child-env.js";
+import { shouldDeferCompaction } from "./compact-defer.js";
 import { spawnInOwnProcessGroup } from "./spawn.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
@@ -2195,6 +2196,10 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
+		if (shouldDeferCompaction(event.reason, activeQueryContexts)) {
+			debug("session_before_compact: threshold compaction deferred, a Claude Code query is live mid-turn");
+			return { cancel: true };
+		}
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +
 			`isSplitTurn=${event.preparation.isSplitTurn} messages=${event.preparation.messagesToSummarize.length} ` +
