@@ -10,6 +10,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { CC_CHILD_ENV, claudeCodeChildEnv } from "./child-env.js";
 import { shouldDeferCompaction } from "./compact-defer.js";
+import { missingCwdError } from "./cwd-check.js";
 import { spawnInOwnProcessGroup } from "./spawn.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, renderSkillsBlock } from "./skills.js";
@@ -1621,6 +1622,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// --- Fresh query ---
+
+	// Checked before anything is claimed, like the system prompt below.
+	const cwdError = missingCwdError(process.cwd());
+	if (cwdError) {
+		debug(`provider: ${cwdError}`);
+		queueMicrotask(() => {
+			stream.push({ type: "error", reason: "error", error: newAssistantOutput(model, "", "error", cwdError) });
+			stream.end();
+		});
+		return stream;
+	}
 
 	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
 	//    background subagents can run concurrently with the parent query.
