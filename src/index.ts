@@ -9,7 +9,7 @@ import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { CC_CHILD_ENV, claudeCodeChildEnv } from "./child-env.js";
-import { shouldDeferCompaction } from "./compact-defer.js";
+import { COMPACTION_SHOULD_DEFER_KEY, COMPACTION_SUMMARY_OWNER_KEY, shouldDeferCompaction } from "./compact-defer.js";
 import { missingCwdError } from "./cwd-check.js";
 import { spawnInOwnProcessGroup } from "./spawn.js";
 import { applyLongContext, buildModels, claudeCodeModelId, type LongContextSettings, resolveModel as _resolveModel } from "./models.js";
@@ -2206,11 +2206,27 @@ export default function (pi: ExtensionAPI) {
 		clearSession("session_shutdown");
 	});
 
+	// Other extensions answering session_before_compact can ask whether this one
+	// is about to cancel the compaction, so they do not write a summary that is
+	// thrown away (pi runs every handler and keeps the last result).
+	(globalThis as Record<symbol, unknown>)[COMPACTION_SHOULD_DEFER_KEY] = (event: { reason?: string }, ctx: { model?: { baseUrl?: string } }) =>
+		ctx?.model?.baseUrl === "claude-bridge" && shouldDeferCompaction(event?.reason, activeQueryContexts);
+
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (ctx.model?.baseUrl !== "claude-bridge") return undefined;
 		if (shouldDeferCompaction(event.reason, activeQueryContexts)) {
 			debug("session_before_compact: threshold compaction deferred, a Claude Code query is live mid-turn");
 			return { cancel: true };
+		}
+		// Another extension owns the summary (its own rules, size bound, handoff
+		// note). Its summariser call reaches this provider marked cacheRetention
+		// "none" and is served by the isolated path, so the takeover below would
+		// only write a second summary and replace the first (2026-11: 81 of 81
+		// bridge compactions lost the owner's summary and its note this way).
+		const summaryOwner = (globalThis as Record<symbol, unknown>)[COMPACTION_SUMMARY_OWNER_KEY];
+		if (summaryOwner) {
+			debug(`session_before_compact: summary left to ${String(summaryOwner)}`);
+			return undefined;
 		}
 		debug(
 			`session_before_compact: takeover reason=${event.reason} willRetry=${event.willRetry} ` +

@@ -23,3 +23,10 @@ export function shouldDeferCompaction(
 	}
 	return false;
 }
+
+// Cross-extension contract, keyed by global symbols so neither side imports the
+// other: a summary owner sets SUMMARY_OWNER (any truthy value, its name), and
+// this extension publishes under SHOULD_DEFER a predicate (event, ctx) => boolean
+// that is true when the compaction is about to be cancelled here.
+export const COMPACTION_SUMMARY_OWNER_KEY = Symbol.for("pi.compaction.summaryOwner");
+export const COMPACTION_SHOULD_DEFER_KEY = Symbol.for("pi.compaction.shouldDefer");
