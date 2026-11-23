@@ -14,7 +14,7 @@ export default function summaryOwner(pi: any): void {
 			compaction: {
 				...result,
 				summary: `${result.summary.trimEnd()}\n\nOWNER-NOTE: appended by the summary owner`,
-				details: { ...(result.details ?? {}), summaryOwner: "test-owner" },
+				details: { ...((result.details as Record<string, unknown> | undefined) ?? {}), summaryOwner: "test-owner" },
 			},
 		};
 	});
