@@ -41,6 +41,8 @@ the footnote below the table).
 | `claude-opus-4-7[1m]`    | 1M               | 1M              | 1M               | 1M              |
 | `claude-opus-4-6`         | 200K             | 200K            | 200K             | 200K            |
 | `claude-opus-4-6[1m]`    | 429              | 1M              | 1M               | 1M              |
+| `claude-fable-5-2`        | —                | —               | 1M§              | —               |
+| `claude-fable-5-2[1m]`   | —                | —               | 1M§              | —               |
 | `claude-fable-5`          | 200K             | —               | —                | —               |
 | `claude-fable-5[1m]`     | 1M               | —               | —                | —               |
 | `claude-sonnet-5-5`       | —                | —               | 200K‡            | —               |
@@ -57,7 +59,10 @@ Raw runs: `.test-output/context-size/{pro,max}-2026-06-26T21-*.json`
 `—` = not yet tested in that condition. ‡ Sonnet 5.5 rows measured 2026-09-29
 with `claude -p --output-format json` on Claude Code 2.1.282 (Max plan), reading
 `modelUsage.contextWindow`; the id is absent from pi-ai 0.87.1 and is added by
-`CATALOG_SUPPLEMENTS` in `src/models.ts` until pi-ai lists it. Max-credits-on matched Pro-credits-on
+`CATALOG_SUPPLEMENTS` in `src/models.ts` until pi-ai lists it. § Fable 5.2 rows
+measured 2026-11-10 the same way on Claude Code 2.1.322 (Max 20x) and confirmed
+with a successful turn; the Agent SDK 0.3.280's bundled Claude Code 2.1.280
+rejects the id with a 400 ("version 2.1.290 or newer is required"). Max-credits-on matched Pro-credits-on
 for every cell tested in both (shown for completeness). Opus 5.5 is enabled at
 1M in the bridge based on [Anthropic's documentation](https://code.claude.com/docs/en/model-config#extended-context)
 for Opus 4.7 and later (1M by default on the Anthropic API, including Pro),

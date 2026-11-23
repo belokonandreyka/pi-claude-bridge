@@ -110,6 +110,10 @@ const MEASURED_ONE_M = new Set([
 	// Measured 2026-09-29 through Claude Code 2.1.282 on Max: bare id serves 200K,
 	// `[1m]` serves 1M (modelUsage.contextWindow). Not yet measured on Pro.
 	"claude-sonnet-5-5",
+	// Measured 2026-11-10 through Claude Code 2.1.322 on Max: bare id and `[1m]`
+	// both serve 1M (modelUsage.contextWindow). Needs Claude Code 2.1.290+; the
+	// SDK-bundled 2.1.280 answers 400. Not yet measured on Pro.
+	"claude-fable-5-2",
 ]);
 
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when

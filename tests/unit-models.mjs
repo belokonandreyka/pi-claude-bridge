@@ -216,6 +216,10 @@ it("claude-opus-5-5 requests 1M on Pro", () => {
 	assert.deepEqual(resolveClaudeCodeRuntimeModel({ id: "claude-opus-5-5" }, PRO), { cliModelId: "claude-opus-5-5[1m]", contextWindow: 1000000 });
 });
 
+it("claude-fable-5-2 requests 1M on Pro", () => {
+	assert.deepEqual(resolveClaudeCodeRuntimeModel({ id: "claude-fable-5-2" }, PRO), { cliModelId: "claude-fable-5-2[1m]", contextWindow: 1000000 });
+});
+
 it("claude-sonnet-5-5 requests 1M on Pro", () => {
 	assert.deepEqual(resolveClaudeCodeRuntimeModel({ id: "claude-sonnet-5-5" }, PRO), { cliModelId: "claude-sonnet-5-5[1m]", contextWindow: 1000000 });
 });
